@@ -1486,6 +1486,94 @@ def cluster_embeddings(
     )
 
 
+def cluster_confidence(
+    embeddings: torch.Tensor,
+    labels: torch.Tensor,
+    centroids: torch.Tensor,
+    manifold: ManifoldHead,
+    *,
+    temperature: float = 1.0,
+) -> list[float | None]:
+    """Per-point ordinal confidence for an unsupervised clustering.
+
+    Every algorithm in :func:`cluster_embeddings` returns
+    ``(labels, centroids)`` where the centroids are cluster representatives
+    on the manifold — true Fréchet-mean centroids for ``kmeans`` /
+    ``meanshift`` and on-manifold *medoids* for the density / graph
+    algorithms (``hdbscan``, ``graph_cc``, ``leiden``, ``dbscan``,
+    ``optics``, ``affinity_propagation``). This turns that geometry into a
+    single per-document confidence signal so the unsupervised (S1) path
+    stops handing downstream consumers a column of ``None``.
+
+    The signal is the **peak of the softmax over negative manifold distances
+    to the centroids** — identical in form to the nearest-prototype
+    confidence :func:`assign_to_prototypes` already produces for S2-S5, so
+    "confidence" means the same thing across every scenario. Concretely, for
+    a document with distances ``d_1..d_C`` to the ``C`` centroids,
+    ``confidence = max_j softmax(-d / temperature)_j``. A document that sits
+    much closer to one centroid than the rest scores near ``1``; one that is
+    roughly equidistant from several scores near ``1/C``. This is exactly the
+    medoid-margin reading the roadmap calls for on the centroid methods, and
+    a boundary ("border") reading on the density / graph methods — a point on
+    a cluster's edge is closer to being reassigned, so its peak softmax is
+    lower.
+
+    **Noise points** (``labels[i] == -1``, emitted by every density / graph
+    algorithm for low-density regions) are the algorithm's own statement that
+    the document does not belong to any cluster, so they are pinned to
+    ``0.0`` regardless of geometry — the honest floor of the scale.
+
+    The score is deliberately *ordinal*, not a calibrated probability:
+    softmax temperature is a free scale and the medoid geometry is only a
+    proxy for HDBSCAN's native membership / GLOSH scores. Temperature/Platt
+    scaling and conformal coverage guarantees are a separate, heavier layer
+    (they belong with the calibrated-confidence work, not here). What this
+    buys today is a real, monotone, per-document signal the novelty gate and
+    any consolidation / review step can threshold on instead of a null.
+
+    Args:
+        embeddings: ``[N, D]`` points, in the *same* space the clustering ran
+            in (i.e. the reduced Euclidean space when a reducer is active, so
+            distances line up with the returned ``centroids``).
+        labels: ``[N]`` integer cluster ids as returned by
+            :func:`cluster_embeddings` (``-1`` = noise).
+        centroids: ``[C, D]`` cluster representatives (may be empty when the
+            algorithm routed everything to noise).
+        manifold: Active manifold head for the clustering space — supplies
+            ``pairwise_dist``.
+        temperature: Softmax temperature (> 0). Larger values flatten the
+            distribution (lower, more conservative confidences); the default
+            ``1.0`` matches :func:`assign_to_prototypes`.
+
+    Returns:
+        Length-``N`` list of confidences in ``[0, 1]``. Noise points are
+        ``0.0``; when there are no centroids at all every point is ``0.0``.
+        Typed ``float | None`` to slot directly into
+        :attr:`~clustering.scenarios.base.ScenarioResult.confidence`, but in
+        practice every entry is a concrete float.
+    """
+    if temperature <= 0.0:
+        raise ValueError(f"temperature must be > 0; got {temperature!r}.")
+
+    n = int(embeddings.shape[0])
+    if n == 0:
+        return []
+
+    label_ints = [int(x) for x in labels.tolist()]
+
+    # No surviving clusters — the algorithm called the whole corpus noise.
+    if int(centroids.shape[0]) == 0:
+        return [0.0] * n
+
+    d = manifold.pairwise_dist(embeddings, centroids)  # [N, C]
+    logits = -d / float(temperature)
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    peak = probs.amax(dim=-1)  # [N]
+    peak_vals = [float(p) for p in peak.tolist()]
+
+    return [0.0 if label_ints[i] < 0 else peak_vals[i] for i in range(n)]
+
+
 @dataclass
 class AssignmentResult:
     """Output of :func:`assign_to_prototypes`.

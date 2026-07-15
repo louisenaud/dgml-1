@@ -40,6 +40,7 @@ from dgml_core.errors import ClassificationConfigMissing, ClassificationFailed
 from dgml_core.llm_clustering import (
     DEFAULT_MAX_FILES,
     LLMClusteringResult,
+    _group_confidence,
     llm_cluster_files,
 )
 from dgml_core.models import DocSet, FileRecord
@@ -428,6 +429,96 @@ def test_missing_groups_array_raises(workspace: Workspace) -> None:
     with patch("litellm.completion", return_value=_raw_response("group_documents", json.dumps({}))):
         with pytest.raises(ClassificationFailed, match="missing a 'groups' array"):
             llm_cluster_files(workspace, ["a"], config=_config())
+
+
+# ---------------------------------------------------------------------------
+# Self-reported confidence
+# ---------------------------------------------------------------------------
+
+
+def test_group_confidence_propagates_to_every_member(workspace: Workspace) -> None:
+    for fid in ("a", "b", "c"):
+        _seed(workspace, fid)
+    groups = [
+        _new_group("Invoice", ["doc_1", "doc_2"], confidence=0.9),
+        _new_group("Contract", ["doc_3"], confidence=0.4),
+    ]
+    with patch("litellm.completion", return_value=_group_response(groups)):
+        result = llm_cluster_files(workspace, ["a", "b", "c"], config=_config())
+
+    # Every file inherits its group's self-reported confidence.
+    assert result.confidences == {"a": 0.9, "b": 0.9, "c": 0.4}
+
+
+def test_group_confidence_absent_is_none(workspace: Workspace) -> None:
+    for fid in ("a", "b"):
+        _seed(workspace, fid)
+    # No `confidence` key on either group — the field is optional.
+    groups = [_new_group("Invoice", ["doc_1"]), _new_group("Contract", ["doc_2"])]
+    with patch("litellm.completion", return_value=_group_response(groups)):
+        result = llm_cluster_files(workspace, ["a", "b"], config=_config())
+
+    assert result.confidences == {"a": None, "b": None}
+
+
+def test_confidence_property_declared_in_tool_schema(workspace: Workspace) -> None:
+    _seed(workspace, "a")
+    with patch(
+        "litellm.completion", return_value=_group_response([_new_group("T", ["doc_1"])])
+    ) as completion:
+        llm_cluster_files(workspace, ["a"], config=_config())
+    props = completion.call_args.kwargs["tools"][0]["function"]["parameters"]["properties"][
+        "groups"
+    ]["items"]["properties"]
+    assert props["confidence"]["type"] == "number"
+    assert props["confidence"]["minimum"] == 0.0
+    assert props["confidence"]["maximum"] == 1.0
+    # Optional — never forced into `required`, so lite models can omit it.
+    required = completion.call_args.kwargs["tools"][0]["function"]["parameters"]["properties"][
+        "groups"
+    ]["items"]["required"]
+    assert "confidence" not in required
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (0.0, 0.0),
+        (1.0, 1.0),
+        (0.73, 0.73),
+        (1, 1.0),  # bare int accepted
+        (0, 0.0),
+        (1.5, 1.0),  # clamped high
+        (-0.2, 0.0),  # clamped low
+        (None, None),  # missing
+        ("0.9", None),  # string not accepted
+        (True, None),  # bool is not a number here
+        (float("nan"), None),  # NaN rejected
+    ],
+)
+def test_group_confidence_parsing(raw: Any, expected: float | None) -> None:
+    # An explicit ``confidence`` value (including ``None``) is parsed the same
+    # way the absent-key case is; the missing-key path has its own test.
+    assert _group_confidence({"members": ["doc_1"], "confidence": raw}) == expected
+
+
+def test_group_confidence_missing_key() -> None:
+    assert _group_confidence({"members": ["doc_1"]}) is None
+
+
+def test_clustering_llm_assignment_carries_confidence(workspace: Workspace) -> None:
+    """End-to-end: the model's self-reported confidence rides through
+    ``clustering()`` onto each emergent bucket's assignment detail."""
+    for fid in ("a", "b"):
+        _seed(workspace, fid)
+    write_classification_config(workspace, {"model": DEFAULT_TEST_MODEL})
+
+    groups = [_new_group("Invoice", ["doc_1", "doc_2"], confidence=0.85)]
+    with patch("litellm.completion", return_value=_group_response(groups)):
+        out = clustering(workspace, method="llm")
+
+    assert out["assignments"]["a"]["confidence"] == 0.85
+    assert out["assignments"]["b"]["confidence"] == 0.85
 
 
 # ---------------------------------------------------------------------------

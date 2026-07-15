@@ -292,9 +292,11 @@ def clustering(
     - ``n_new_clusters``: number of *new* DocSets created this run.
     - ``assignments``: ``{file_id: {"docset", "confidence", "is_new"}}``
       for every successfully-assigned file — ``confidence`` is the
-      nearest-prototype confidence in ``[0, 1]`` (``null`` for emergent
-      clusters), ``is_new`` flags files that landed in a DocSet created
-      this run.
+      assignment confidence in ``[0, 1]``: the nearest-prototype softmax
+      peak (incremental), the unsupervised clustering-geometry score
+      (fresh / S1 emergent buckets), or the model's self-report (the ``llm``
+      method). It is ``null`` only when the backend produced no score for a
+      file. ``is_new`` flags files that landed in a DocSet created this run.
 
     ``skip_existing`` makes the whole call a no-op (returns ``skipped: True``,
     empty maps) when every file is already assigned — cheap to use on resume.
@@ -423,7 +425,11 @@ def clustering(
                 clusters[file_id] = new_name
                 assignments[file_id] = {
                     "docset": new_name,
-                    "confidence": None,
+                    # Emergent buckets now carry a real confidence too: the
+                    # clustering-geometry score for the embedding path (S1) or
+                    # the model's self-report for the LLM path. ``None`` only
+                    # when the backend produced no score for this file.
+                    "confidence": internal.confidences.get(file_id),
                     "is_new": True,
                 }
 
@@ -646,7 +652,10 @@ def _llm_cluster_internal(
     return _InternalResult(
         clusters=result.clusters,
         render_skipped=render_skipped,
-        confidences=dict.fromkeys(result.clusters),
+        # The LLM backend now reports a per-group self-reported confidence for
+        # each grouped file (``None`` only where the model omitted it), instead
+        # of the null-for-everything ``dict.fromkeys`` this used to emit.
+        confidences={fid: result.confidences.get(fid) for fid in result.clusters},
         mode=effective_mode,
         method="llm",
         known_categories=known_categories,

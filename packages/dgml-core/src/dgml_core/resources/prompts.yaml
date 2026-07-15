@@ -261,4 +261,6 @@ cluster_grouping_instructions: |-
       - `description`: a one-sentence description of what kind of document this group holds, and
       - `key_questions`: 3-7 concrete, type-discriminating questions answerable from the first pages of this kind of document.
 
+  For every group also set `confidence`: a number from 0.0 to 1.0 saying how sure you are that its documents really are one document type and belong together (and, for an existing DocSet, that they match it). Use high values for clean, obvious groupings and lower values for borderline or mixed ones.
+
   Group by the underlying document type, not by surface appearance. Two documents belong in the SAME group whenever the same core questions could be answered from each — even if they differ in layout, length, section order, formatting, issuer, or which optional sections are present. Those are variations of one type, not separate types. Create a separate group only when a document answers a genuinely different set of questions (a different extraction schema). When two documents are borderline, put them TOGETHER. Prefer fewer, larger groups; do not split a type into sub-variants.

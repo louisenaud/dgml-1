@@ -68,7 +68,11 @@ import torch
 from clustering.config.schema import UNSUPERVISED_LOSSES
 from clustering.data.datasets import DocumentDataset
 from clustering.scenarios.base import Scenario, ScenarioResult
-from clustering.scenarios.clustering import cluster_embeddings, reduce_embeddings
+from clustering.scenarios.clustering import (
+    cluster_confidence,
+    cluster_embeddings,
+    reduce_embeddings,
+)
 
 
 class S1Unsupervised(Scenario):
@@ -332,7 +336,15 @@ class S1Unsupervised(Scenario):
         predictions: list[str | None] = [
             "cluster_noise" if li == -1 else f"cluster_{li}" for li in labels_list
         ]
-        confidence: list[float | None] = [None] * len(doc_ids)
+        # Per-document ordinal confidence from the clustering geometry. Computed
+        # in the *clustering* space (``cluster_input`` / ``cluster_manifold``) so
+        # distances line up with the ``centroids`` the algorithm returned — this
+        # is the reduced Euclidean space when a reducer is active, else the
+        # representation manifold. Noise points come back as ``0.0``; every other
+        # document gets its peak softmax over centroid distances. This replaces
+        # the column of ``None`` S1 used to emit, so the novelty gate and any
+        # downstream review / consolidation step have a real signal to threshold.
+        confidence = cluster_confidence(cluster_input, labels_t, centroids, cluster_manifold)
 
         n_noise = sum(1 for li in labels_list if li == -1)
         n_clusters_found = int(centroids.shape[0])

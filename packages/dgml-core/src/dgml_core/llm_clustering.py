@@ -87,6 +87,16 @@ class LLMClusteringResult:
     :func:`dgml_core.clustering.clustering` flow can create the DocSet
     directly instead of issuing a second naming call.
 
+    ``confidences`` maps each successfully-grouped ``file_id`` to the
+    model's *self-reported* confidence in that grouping, in ``[0, 1]``, or
+    ``None`` when the model omitted it for the group. Every file in a group
+    inherits the group's reported confidence. This mirrors the ``confidence``
+    column the embedding path carries on
+    :class:`~dgml_core.run_clustering.DocPrediction`, so the LLM backend stops
+    handing downstream consumers a column of ``None``. It is an ordinal
+    self-report, not a calibrated probability — a cheap, single-call signal
+    (no second partitioning pass); calibration is a heavier, separate layer.
+
     ``failed_file_ids`` lists files that were not placed in any cluster:
     those with no rendered page image, those over the ``max_files`` cap, and
     any the model omitted from every group.
@@ -95,6 +105,7 @@ class LLMClusteringResult:
     clusters: dict[str, str]
     proposals: dict[str, ClassificationDecision] = field(default_factory=dict)
     failed_file_ids: list[str] = field(default_factory=list)
+    confidences: dict[str, float | None] = field(default_factory=dict)
 
 
 def llm_cluster_files(
@@ -213,6 +224,7 @@ def _assemble_result(
     # model that answers with "1" / "doc1" / "Document 1" still resolves.
     by_number = {label.split("_", 1)[1]: fid for label, fid in labels.items()}
     clusters: dict[str, str] = {}
+    confidences: dict[str, float | None] = {}
     proposals: dict[str, ClassificationDecision] = {}
     assigned: set[str] = set()
     new_index = 0
@@ -245,12 +257,14 @@ def _assemble_result(
             decision = _new_group_decision(group)
             cluster_name = f"unknown_{new_index}"
 
+        group_conf = _group_confidence(group)
         committed = 0
         for member in members:
             fid = _resolve_member(member, labels, by_number)
             if fid is None or fid in assigned:
                 continue
             clusters[fid] = cluster_name
+            confidences[fid] = group_conf
             assigned.add(fid)
             committed += 1
 
@@ -276,7 +290,30 @@ def _assemble_result(
     for fid in pre_failed:
         if fid not in failed:
             failed.append(fid)
-    return LLMClusteringResult(clusters=clusters, proposals=proposals, failed_file_ids=failed)
+    return LLMClusteringResult(
+        clusters=clusters,
+        proposals=proposals,
+        failed_file_ids=failed,
+        confidences=confidences,
+    )
+
+
+def _group_confidence(group: dict[str, Any]) -> float | None:
+    """Extract the model's self-reported confidence for one group.
+
+    Accepts a numeric ``confidence`` in ``[0, 1]`` (ints allowed, e.g. a bare
+    ``1``); clamps into range defensively. Returns ``None`` for a missing,
+    non-numeric, boolean, or NaN value — the model omitting the field is
+    normal for lite models, and a null confidence is honest.
+    """
+    raw = group.get("confidence")
+    # ``bool`` is an ``int`` subclass — exclude it so ``True`` isn't read as 1.0.
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    value = float(raw)
+    if value != value:  # NaN
+        return None
+    return max(0.0, min(1.0, value))
 
 
 def _resolve_member(member: Any, labels: dict[str, str], by_number: dict[str, str]) -> str | None:
@@ -430,6 +467,17 @@ def _group_documents_tool(docsets: list[DocSet]) -> dict[str, Any]:
             "description": (
                 "For a NEW document type: 3-7 concrete, type-discriminating "
                 "questions answerable from the first pages."
+            ),
+        },
+        "confidence": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "description": (
+                "Your confidence, from 0.0 to 1.0, that these documents really "
+                "are the same document type and belong together in this group "
+                "(and, when assigning to an existing DocSet, that they match "
+                "it). Use lower values for borderline or mixed groups."
             ),
         },
     }
