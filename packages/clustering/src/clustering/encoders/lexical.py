@@ -65,6 +65,13 @@ class TfidfEncoder(Encoder[str]):
         corpus = self._read_corpus(Path(corpus_dir), text_view)
         if not corpus:
             raise ValueError(f"tfidf encoder found no page_text under {corpus_dir!r}.")
+        if not any(doc.strip() for doc in corpus):
+            raise ValueError(
+                f"tfidf encoder found {len(corpus)} files under {corpus_dir!r} but none "
+                "contain extracted text. Scanned/image PDFs need OCR: configure an 'ocr' "
+                "provider in config.json (Apple Vision on macOS, or azure/aws) and re-add "
+                "the files with --text-mode ocr|hybrid so page_text/ is populated."
+            )
 
         self._vectorizer = TfidfVectorizer(
             stop_words="english",

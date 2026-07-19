@@ -63,7 +63,8 @@ dgml cluster --workspace ./ws --method auto
 
 See [`dgml cluster`](cli-reference.md) for the full flag reference and the
 JSON output shape (including the additive `mode`, `n_assigned_existing`,
-`n_new_clusters`, and `assignments` fields).
+`n_new_clusters`, `assignments` — whose per-file `review` flag marks
+low-confidence assignments — and `review_queue` fields).
 
 ## Config presets (compute tiers)
 

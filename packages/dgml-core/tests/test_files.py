@@ -107,6 +107,23 @@ def test_add_pdf(store: FileStore, sample_pdf: Path) -> None:
 
 
 @needs_gs
+def test_add_pdf_custom_dpi_is_recorded_and_rendered(store: FileStore, sample_pdf: Path) -> None:
+    """A non-default --dpi threads through to the renderer and onto the record."""
+    result = store.add(sample_pdf, dpi=150)
+    assert result.record.page_image_dpi == 150
+    assert result.page_render_error is None
+    pages = list(store.ws.file_pages_dir(result.record.id).glob("page_*.png"))
+    assert len(pages) == 2  # rendering still succeeds at the lower resolution
+
+
+def test_add_rejects_nonpositive_dpi(store: FileStore, sample_pdf: Path) -> None:
+    """dpi <= 0 is rejected before the workspace is touched (no orphan record)."""
+    with pytest.raises(ValueError, match="dpi"):
+        store.add(sample_pdf, dpi=0)
+    assert not any(store.ws.files_dir.iterdir())  # nothing created
+
+
+@needs_gs
 def test_original_path_stored_relative_to_workspace(store: FileStore, sample_pdf: Path) -> None:
     """original_path is recorded relative to the workspace root and still
     resolves back to the source from there — keeping the workspace portable."""

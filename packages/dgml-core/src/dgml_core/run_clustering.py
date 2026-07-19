@@ -69,6 +69,7 @@ from clustering.scenarios.s3_partial_few_shot import S3PartialFewShot
 from clustering.scenarios.s4_zero_shot import S4ZeroShot
 from clustering.scenarios.s5_full_supervised import S5FullSupervised
 
+from .classification import ClassificationConfig
 from .errors import ClusteringConfigInvalid
 
 _CONFIG_RESOURCE = "clustering_config.json"
@@ -117,10 +118,15 @@ class DocPrediction:
     ``0.0`` for documents the algorithm flagged as noise) for the
     unsupervised path. It is ``None`` only when the underlying scenario
     genuinely produced no score for a document.
+
+    ``review`` is the abstain flag (§4.4): ``True`` when the calibration /
+    abstain gate is not confident enough to auto-accept the assignment and it
+    should be routed to a human review queue. Defaults to ``False``.
     """
 
     cluster_name: str
     confidence: float | None
+    review: bool = False
 
 
 def run_clustering(
@@ -159,6 +165,8 @@ def run_clustering_detailed(
     n_samples_per_category: int = 0,
     support_dataset: DocumentDataset | None = None,
     overrides: dict[str, Any] | None = None,
+    classification_config: ClassificationConfig | None = None,
+    debug: bool = False,
 ) -> dict[str, DocPrediction]:
     """Cluster ``dataset`` and return ``{doc_id: DocPrediction}``.
 
@@ -205,6 +213,22 @@ def run_clustering_detailed(
     )
     result = scenario.fit_predict(dataset, support_dataset)
 
+    # Optional LLM consolidation of the low-confidence tail (§5). Gated by
+    # ``scenario.consolidation.enabled`` and only when a classification config
+    # (⇒ a usable model + api key) is available; the adjudicator is built here
+    # in the orchestrator so the framework stays LLM-free. Soft-fails inside
+    # :meth:`Scenario.consolidate`, so a missing key / provider error degrades
+    # to the embedding result rather than raising.
+    cons = config.scenario.consolidation
+    if cons.enabled and classification_config is not None:
+        from dataclasses import replace
+
+        from .consolidation import LLMAdjudicator
+
+        adj_cfg = replace(classification_config, model=cons.model or classification_config.model)
+        adjudicator = LLMAdjudicator(adj_cfg, attempts=2, debug=debug)
+        result = scenario.consolidate(result, dataset, adjudicator)
+
     # S1's raw labels are "cluster_N"; rewrite to "unknown_N" so the
     # caller's contract ("emergent cluster ⇒ 'unknown_N'") is the same
     # across scenarios. Every other scenario already either produces
@@ -212,10 +236,12 @@ def run_clustering_detailed(
     # (S4 / S5), so this is a no-op for them.
     rewrite = _cluster_to_unknown if not known_categories else _identity
 
+    n = len(result.doc_ids)
+    review = result.review if len(result.review) == n else [False] * n
     return {
-        doc_id: DocPrediction(cluster_name=rewrite(pred), confidence=conf)
-        for doc_id, pred, conf in zip(
-            result.doc_ids, result.predictions, result.confidence, strict=True
+        doc_id: DocPrediction(cluster_name=rewrite(pred), confidence=conf, review=bool(rev))
+        for doc_id, pred, conf, rev in zip(
+            result.doc_ids, result.predictions, result.confidence, review, strict=True
         )
         if pred is not None
     }

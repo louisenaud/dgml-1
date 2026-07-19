@@ -588,7 +588,7 @@ def test_file_add_hybrid_records_hybrid_mode_and_summary(
     # patch of render_pages so the OCR path finds JPEGs without `gs`.
     import dgml_core.files as files_mod
 
-    def fake_render(pdf_path: Path, output_dir: Path) -> int:
+    def fake_render(pdf_path: Path, output_dir: Path, *, dpi: int = 300) -> int:
         _seed_page_images(output_dir, n=2)
         return 2
 

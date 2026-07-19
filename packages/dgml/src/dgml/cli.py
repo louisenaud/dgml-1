@@ -37,6 +37,7 @@ from dgml_core.docsets import DocSetStore
 from dgml_core.errors import DgmlError, WorkspaceNotInitialized, short_error_message
 from dgml_core.files import AddFileResult, ConflictPolicy, FileStore
 from dgml_core.models import DocSet
+from dgml_core.pages import DEFAULT_DPI
 from dgml_core.storage import Workspace, read_json
 from dgml_core.text_extraction import TextMode
 
@@ -443,6 +444,18 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     fl_add.add_argument(
+        "--dpi",
+        type=_positive_int,
+        default=DEFAULT_DPI,
+        help=(
+            f"Resolution (dots per inch) for page-image rendering (default "
+            f"{DEFAULT_DPI}). Lower it (e.g. 150) to roughly halve rasterization "
+            "time and disk use — usually ample for OCR and the downscaled "
+            "clustering vision encoder; keep the default for archival fidelity. "
+            "Must be a positive integer. Recorded per-file as page_image_dpi."
+        ),
+    )
+    fl_add.add_argument(
         "--auto-classify",
         action="store_true",
         help=(
@@ -469,6 +482,17 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_chain_subparsers(sub, common)
 
     return parser
+
+
+def _positive_int(raw: str) -> int:
+    """argparse type: a strictly-positive integer (rejects 0 and negatives)."""
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not an integer") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value}")
+    return value
 
 
 def _parse_child_path(raw: str) -> list[int]:
@@ -2455,7 +2479,13 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
     entries: list[dict[str, Any]] = []
     for pdf in pdfs:
         try:
-            result = store.add(pdf, on_conflict=on_conflict, text_mode=text_mode, debug=args.debug)
+            result = store.add(
+                pdf,
+                on_conflict=on_conflict,
+                text_mode=text_mode,
+                dpi=args.dpi,
+                debug=args.debug,
+            )
         except DgmlError as exc:
             counts["hard_failed"] += 1
             entries.append(
@@ -2507,6 +2537,7 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
             args.path,
             on_conflict=ConflictPolicy(args.on_conflict),
             text_mode=TextMode(args.text_mode),
+            dpi=args.dpi,
             verbose=args.verbose,
             debug=args.debug,
         )

@@ -19,6 +19,7 @@ then assigned to its nearest prototype.
 
 from __future__ import annotations
 
+from clustering.calibration import fit_support_calibrator
 from clustering.data.datasets import DocumentDataset
 from clustering.scenarios.base import Scenario, ScenarioResult
 from clustering.scenarios.clustering import assign_to_prototypes
@@ -60,12 +61,36 @@ class S5FullSupervised(Scenario):
         doc_ids, fused, true_labels = self.fused_embeddings(unknown_dataset)
         embeddings = self.projector(fused)
 
-        result = assign_to_prototypes(embeddings, prototypes, self.manifold)
+        sc = self.config.scenario
+        # Calibrate on the labeled support set (leave-one-out) + abstain gate.
+        calibrator = fit_support_calibrator(
+            support_embeddings,
+            support_labels,
+            cats,
+            self.manifold,
+            method=sc.calibration.method,
+            coverage=sc.calibration.coverage,
+            abstain_threshold=sc.calibration.abstain_threshold,
+        )
+        result = assign_to_prototypes(
+            embeddings,
+            prototypes,
+            self.manifold,
+            calibrator=calibrator,
+            abstain_threshold=sc.calibration.abstain_threshold if calibrator is None else None,
+        )
         labels_t, conf_t, probs_t = result.labels, result.confidence, result.probs
         labels_arr = labels_t.detach().numpy() if hasattr(labels_t, "numpy") else labels_t
-        conf_arr = conf_t.detach().numpy() if hasattr(conf_t, "numpy") else conf_t
+        cal_t = result.calibrated_confidence if result.calibrated_confidence is not None else conf_t
+        conf_arr = cal_t.detach().numpy() if hasattr(cal_t, "numpy") else cal_t
         predictions: list[str | None] = [cats[int(li)] for li in labels_arr.tolist()]
         confidence: list[float | None] = [float(c) for c in conf_arr.tolist()]
+        abstain_t = result.abstain
+        review: list[bool] = (
+            [bool(x) for x in abstain_t.tolist()]
+            if abstain_t is not None
+            else [False] * len(doc_ids)
+        )
 
         return ScenarioResult(
             run_id=self.run_id,
@@ -77,11 +102,14 @@ class S5FullSupervised(Scenario):
             true_labels=true_labels,
             scores=probs_t,
             class_names=list(cats),
+            review=review,
             metadata={
                 "prototype_source": "support_mean",
                 "n_shots": n_shots,
                 "n_support": len(support_dataset),
                 "categories": list(cats),
+                "n_review": int(sum(review)),
+                "calibration": result.calibration,
                 "projector_trained": bool(train_history),
                 "projector_loss_history": train_history,
             },

@@ -65,6 +65,7 @@ from typing import Any, Literal, cast
 import numpy as np
 import torch
 
+from clustering.calibration import Calibrator
 from clustering.manifolds.base import ManifoldHead
 
 _log = logging.getLogger(__name__)
@@ -1486,13 +1487,83 @@ def cluster_embeddings(
     )
 
 
+def _auto_temperature(centroids: torch.Tensor, manifold: ManifoldHead) -> float:
+    """Softmax temperature set to the characteristic inter-centroid distance.
+
+    With ``T = 1`` the softmax over negative manifold distances saturates to
+    ~1.0 for *every* document whenever the clusters are well separated — e.g.
+    after a UMAP / t-SNE reduction spreads them far apart — leaving the
+    confidence column with no usable spread for the consolidation selector to
+    rank on (every document ties at 1.0, so a bottom-quantile cut is
+    arbitrary). Scaling ``T`` to the median pairwise centroid distance rescales
+    the logits so the peak softmax lands in ``[1/C, 1]`` with real gradient:
+    boundary documents score distinctly lower than core ones. The *ordering* is
+    unchanged (peak softmax is monotone in the nearest-vs-next distance gap for
+    a fixed ``T``), so this is a rescaling of the ordinal signal, not a change
+    of what "more confident" means.
+
+    Returns ``1.0`` (a no-op) when there are fewer than two centroids, or when
+    the centroids are coincident (degenerate median distance).
+    """
+    c = int(centroids.shape[0])
+    if c < 2:
+        return 1.0
+    dmat = manifold.pairwise_dist(centroids, centroids)  # [C, C]
+    iu = torch.triu_indices(c, c, offset=1)
+    pdist = dmat[iu[0], iu[1]]
+    med = float(pdist.median().item()) if int(pdist.numel()) else 0.0
+    return med if med > 1e-9 else 1.0
+
+
+def _resolve_temperature(
+    temperature: float | Literal["auto"],
+    centroids: torch.Tensor,
+    manifold: ManifoldHead,
+) -> float:
+    """Coerce the ``temperature`` argument to a concrete positive scale.
+
+    ``"auto"`` defers to :func:`_auto_temperature`; a float is validated ``> 0``.
+    """
+    if isinstance(temperature, str):
+        if temperature != "auto":
+            raise ValueError(
+                f"temperature must be a positive float or 'auto'; got {temperature!r}."
+            )
+        return _auto_temperature(centroids, manifold)
+    t = float(temperature)
+    if t <= 0.0:
+        raise ValueError(f"temperature must be > 0; got {temperature!r}.")
+    return t
+
+
+def cluster_scores(
+    embeddings: torch.Tensor,
+    centroids: torch.Tensor,
+    manifold: ManifoldHead,
+    *,
+    temperature: float | Literal["auto"] = 1.0,
+) -> torch.Tensor:
+    """Soft-assignment matrix ``[N, C]``: softmax over negative manifold
+    distances from each document to each centroid.
+
+    This is the row-normalized geometry the ordinal confidence (peak) and the
+    consolidation ``margin`` selector (top1 - top2) both read. Column ``j``
+    corresponds to the cluster whose centroid is ``centroids[j]``. ``temperature``
+    matches :func:`cluster_confidence` — pass ``"auto"`` to scale it to the
+    inter-centroid separation (see :func:`_auto_temperature`).
+    """
+    temp = _resolve_temperature(temperature, centroids, manifold)
+    d = manifold.pairwise_dist(embeddings, centroids)  # [N, C]
+    return torch.nn.functional.softmax(-d / temp, dim=-1)
+
+
 def cluster_confidence(
     embeddings: torch.Tensor,
     labels: torch.Tensor,
     centroids: torch.Tensor,
     manifold: ManifoldHead,
     *,
-    temperature: float = 1.0,
+    temperature: float | Literal["auto"] = 1.0,
 ) -> list[float | None]:
     """Per-point ordinal confidence for an unsupervised clustering.
 
@@ -1541,9 +1612,13 @@ def cluster_confidence(
             algorithm routed everything to noise).
         manifold: Active manifold head for the clustering space — supplies
             ``pairwise_dist``.
-        temperature: Softmax temperature (> 0). Larger values flatten the
-            distribution (lower, more conservative confidences); the default
-            ``1.0`` matches :func:`assign_to_prototypes`.
+        temperature: Softmax temperature. A positive float flattens the
+            distribution as it grows (lower, more conservative confidences);
+            ``1.0`` matches :func:`assign_to_prototypes`. ``"auto"`` scales the
+            temperature to the inter-centroid separation so the signal has
+            usable spread even when clusters are far apart (see
+            :func:`_auto_temperature`) — the right default for the S1
+            unsupervised path, whose distances live in a UMAP-reduced space.
 
     Returns:
         Length-``N`` list of confidences in ``[0, 1]``. Noise points are
@@ -1552,9 +1627,6 @@ def cluster_confidence(
         :attr:`~clustering.scenarios.base.ScenarioResult.confidence`, but in
         practice every entry is a concrete float.
     """
-    if temperature <= 0.0:
-        raise ValueError(f"temperature must be > 0; got {temperature!r}.")
-
     n = int(embeddings.shape[0])
     if n == 0:
         return []
@@ -1565,9 +1637,7 @@ def cluster_confidence(
     if int(centroids.shape[0]) == 0:
         return [0.0] * n
 
-    d = manifold.pairwise_dist(embeddings, centroids)  # [N, C]
-    logits = -d / float(temperature)
-    probs = torch.nn.functional.softmax(logits, dim=-1)
+    probs = cluster_scores(embeddings, centroids, manifold, temperature=temperature)
     peak = probs.amax(dim=-1)  # [N]
     peak_vals = [float(p) for p in peak.tolist()]
 
@@ -1578,10 +1648,12 @@ def cluster_confidence(
 class AssignmentResult:
     """Output of :func:`assign_to_prototypes`.
 
-    Carries both the per-document tensors (``labels`` / ``distances`` /
-    ``confidence`` / ``probs``) and the *effective* thresholds that were
-    actually applied — distinct from the user-supplied config values
-    whenever quantile auto-calibration kicks in.
+    Carries the per-document tensors (``labels`` / ``distances`` /
+    ``confidence`` / ``probs``), the *effective* thresholds that were actually
+    applied (distinct from the user-supplied config values whenever quantile
+    auto-calibration kicks in), and — when a :class:`~clustering.calibration.Calibrator`
+    is supplied — the ``calibrated_confidence`` and per-document ``abstain``
+    flag for the review queue (§4.4).
     """
 
     labels: torch.Tensor  # [N] int (-1 = unassigned)
@@ -1590,6 +1662,15 @@ class AssignmentResult:
     probs: torch.Tensor  # [N, K] softmax over -distance
     effective_threshold: float | None = None
     effective_confidence_threshold: float | None = None
+    # ── Calibration + abstain (§4.4) ──────────────────────────────────────
+    # ``calibrated_confidence`` equals ``confidence`` when no calibrator was
+    # supplied (the ordinal signal). ``abstain`` flags documents whose
+    # (calibrated) confidence falls below the conformal / floor gate — route
+    # them to human review. ``calibration`` is the fitted calibrator's
+    # provenance dict, or ``None``.
+    calibrated_confidence: torch.Tensor | None = None
+    abstain: torch.Tensor | None = None
+    calibration: dict[str, Any] | None = None
 
 
 def assign_to_prototypes(
@@ -1600,6 +1681,8 @@ def assign_to_prototypes(
     threshold: float | None = None,
     threshold_confidence: float | None = None,
     threshold_quantile: float | None = None,
+    calibrator: Calibrator | None = None,
+    abstain_threshold: float | None = None,
 ) -> AssignmentResult:
     """Nearest-prototype classification with three composable unknown-bucket gates.
 
@@ -1665,6 +1748,22 @@ def assign_to_prototypes(
     if unassigned is not None:
         labels = torch.where(unassigned, torch.full_like(labels, -1), labels)
 
+    # ── Calibrate confidence + decide abstention (§4.4) ──────────────────
+    # The unknown-bucket gates above decide *novelty* (route to a new
+    # cluster); the abstain flag below decides *review* (route to a human)
+    # and never changes the predicted label. When no calibrator is supplied
+    # the calibrated confidence is just the ordinal softmax peak, and an
+    # ``abstain_threshold`` (if given) still applies as a floor on it.
+    if calibrator is not None:
+        calibrated_confidence, abstain = calibrator.apply(logits)
+        calibration = calibrator.as_dict()
+    else:
+        calibrated_confidence = confidence.clone() if hasattr(confidence, "clone") else confidence
+        abstain = torch.zeros_like(labels, dtype=torch.bool)
+        calibration = None
+    if abstain_threshold is not None:
+        abstain = _bool_or(abstain, calibrated_confidence < abstain_threshold)
+
     return AssignmentResult(
         labels=labels,
         distances=distances,
@@ -1672,6 +1771,9 @@ def assign_to_prototypes(
         probs=probs,
         effective_threshold=eff_dist,
         effective_confidence_threshold=eff_conf,
+        calibrated_confidence=calibrated_confidence,
+        abstain=abstain,
+        calibration=calibration,
     )
 
 

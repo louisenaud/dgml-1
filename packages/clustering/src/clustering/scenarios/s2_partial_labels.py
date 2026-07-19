@@ -53,6 +53,10 @@ class S2PartialLabels(Scenario):
         # ── Embed corpus + initial assignment with composable gates ──────
         doc_ids, embeddings, true_labels = self.embed(unknown_dataset)
         sc = self.config.scenario
+        # S2 builds prototypes from category names alone (no labeled samples),
+        # so there is nothing to fit a parametric calibrator on — the reported
+        # confidence stays ordinal. An ``abstain_threshold`` still applies as a
+        # plain floor to route low-confidence known-assignments to review.
         result = assign_to_prototypes(
             embeddings,
             known_protos,
@@ -60,15 +64,19 @@ class S2PartialLabels(Scenario):
             threshold=sc.threshold,
             threshold_confidence=sc.threshold_confidence,
             threshold_quantile=sc.threshold_quantile,
+            abstain_threshold=sc.calibration.abstain_threshold,
         )
         labels_t, conf_t = result.labels, result.confidence
 
         labels_arr = labels_t.detach().numpy() if hasattr(labels_t, "numpy") else labels_t
         conf_arr = conf_t.detach().numpy() if hasattr(conf_t, "numpy") else conf_t
+        abstain_t = result.abstain
+        abstain_arr = [bool(x) for x in abstain_t.tolist()] if abstain_t is not None else None
 
         # ── Cluster the unassigned bucket into emergent categories ───────
         predictions: list[str | None] = [None] * len(doc_ids)
         confidence: list[float | None] = [None] * len(doc_ids)
+        review: list[bool] = [False] * len(doc_ids)
         unknown_idx = [i for i, li in enumerate(labels_arr.tolist()) if int(li) == -1]
         n_unknown = len(unknown_idx)
 
@@ -131,6 +139,8 @@ class S2PartialLabels(Scenario):
             if int(li) != -1:
                 predictions[i] = cats[int(li)]
                 confidence[i] = float(conf_arr[i])
+                if abstain_arr is not None:
+                    review[i] = bool(abstain_arr[i])
 
         return ScenarioResult(
             run_id=self.run_id,
@@ -140,6 +150,7 @@ class S2PartialLabels(Scenario):
             predictions=predictions,
             confidence=confidence,
             true_labels=true_labels,
+            review=review,
             metadata={
                 "categories": list(cats),
                 # Echo the user-supplied gate config + the effective
@@ -152,5 +163,6 @@ class S2PartialLabels(Scenario):
                 "effective_confidence_threshold": result.effective_confidence_threshold,
                 "n_known_assigned": int(sum(1 for p in predictions if p in cats)),
                 "n_unknown": n_unknown,
+                "n_review": int(sum(review)),
             },
         )

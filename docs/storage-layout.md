@@ -75,9 +75,10 @@ with `secrets.choice` ([packages/dgml/src/dgml/ids.py](../packages/dgml/src/dgml
 
 Rendering `page_images/` shells out to ghostscript, which dominates the cost
 of `dgml file add`. The render is a pure function of the PDF bytes (plus the
-fixed 300 dpi and renderer), so when the **`DGML_PAGE_CACHE`** environment
+dpi and renderer), so when the **`DGML_PAGE_CACHE`** environment
 variable names a directory, the renderer keys each render by a content hash
-and reuses it:
+(the PDF bytes, renderer name, and dpi — so `--dpi 150` and the default 300
+cache independently) and reuses it:
 
 - **Hit** — an identical PDF rendered before is copied from the cache and
   ghostscript is not invoked (it need not even be installed).
@@ -661,9 +662,11 @@ each contain one file per page.
 overlap, OCR wins on conflict).
 
 `page_image_dpi` and `page_image_renderer` record how `page_images/` were
-rendered — currently always `300` and `"ghostscript"`, but stored per file
-so a later renderer or DPI change is detectable. They are `null` if a
-non-PDF source failed to convert (no page images were produced).
+rendered — the renderer is `"ghostscript"`, and the DPI is `300` unless
+`dgml file add --dpi N` overrode it. Stored per file so a later renderer or a
+per-add DPI change is detectable (and so `dg:origin` boxes, computed in that
+render's pixel space, can be traced back). They are `null` if a non-PDF source
+failed to convert (no page images were produced).
 
 `pdf_converter` names the converter that turned a non-PDF source into the
 PDF the pipeline ran on (the converter's name with any trailing
@@ -676,8 +679,9 @@ One per page, written regardless of `text_mode` (`"digital"`, `"ocr"`,
 or `"hybrid"` all share this shape). Word locations are
 in **image-pixel space** matching the corresponding `page_images/page_N.png`
 render — i.e. ints with the top-left origin, computed as
-`round(pdf_pts * dpi / 72)` where `dpi` is the same 300 dpi used by
-`render_pages`. Files are compact (one line, no pretty-printing) so a
+`round(pdf_pts * dpi / 72)` where `dpi` is the same value `render_pages` used
+for this file (the record's `page_image_dpi`; 300 by default). Files are
+compact (one line, no pretty-printing) so a
 workspace with many pages doesn't bloat on disk:
 
 ```json

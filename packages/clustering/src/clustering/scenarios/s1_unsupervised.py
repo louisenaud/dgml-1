@@ -71,6 +71,7 @@ from clustering.scenarios.base import Scenario, ScenarioResult
 from clustering.scenarios.clustering import (
     cluster_confidence,
     cluster_embeddings,
+    cluster_scores,
     reduce_embeddings,
 )
 
@@ -344,7 +345,40 @@ class S1Unsupervised(Scenario):
         # document gets its peak softmax over centroid distances. This replaces
         # the column of ``None`` S1 used to emit, so the novelty gate and any
         # downstream review / consolidation step have a real signal to threshold.
-        confidence = cluster_confidence(cluster_input, labels_t, centroids, cluster_manifold)
+        confidence = cluster_confidence(
+            cluster_input,
+            labels_t,
+            centroids,
+            cluster_manifold,
+            temperature=sc.confidence_temperature,
+        )
+        # Soft-assignment matrix over the surviving centroids, in the same
+        # (temperature-scaled) geometry as ``confidence``. Exposed as
+        # ``ScenarioResult.scores`` so the consolidation ``margin`` selector
+        # (top1 - top2 gap) has per-cluster scores to work with — S1 otherwise
+        # emits no scores and margin silently degrades to the quantile cut.
+        # ``None`` when the algorithm routed everything to noise (no centroids).
+        scores: torch.Tensor | None = None
+        cluster_class_names: list[str] | None = None
+        if int(centroids.shape[0]) > 0:
+            scores = cluster_scores(
+                cluster_input,
+                centroids,
+                cluster_manifold,
+                temperature=sc.confidence_temperature,
+            )
+            cluster_class_names = [f"cluster_{j}" for j in range(int(centroids.shape[0]))]
+
+        # Abstain / review queue (§4.4). S1 is unsupervised — there are no
+        # labels to fit a parametric calibrator on, so the ordinal confidence
+        # is reported as-is and abstention is a plain floor: documents below
+        # ``calibration.abstain_threshold`` (and every noise-bucket document)
+        # are routed to human review. Noise is always low-confidence (0.0), so
+        # a threshold > 0 naturally sweeps it in.
+        abstain_threshold = sc.calibration.abstain_threshold
+        review: list[bool] = [False] * len(doc_ids)
+        if abstain_threshold is not None:
+            review = [(c is not None and float(c) < abstain_threshold) for c in confidence]
 
         n_noise = sum(1 for li in labels_list if li == -1)
         n_clusters_found = int(centroids.shape[0])
@@ -357,8 +391,12 @@ class S1Unsupervised(Scenario):
             predictions=predictions,
             confidence=confidence,
             true_labels=true_labels,
+            scores=scores,
+            class_names=cluster_class_names,
+            review=review,
             metadata={
                 "k_clusters": k,
+                "n_review": int(sum(review)),
                 "n_clusters_found": n_clusters_found,
                 "n_noise": n_noise,
                 "centroids_shape": tuple(centroids.shape),

@@ -449,6 +449,33 @@ def test_file_add_show_delete(
     assert rc == 0
 
 
+def test_file_add_dpi_flag_sets_page_image_dpi(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--dpi overrides the default and is recorded on the file (CLI contract)."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--dpi", "150"])
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    assert payload["file"]["page_image_dpi"] == 150
+
+
+def test_file_add_rejects_nonpositive_dpi(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A non-positive --dpi is an argparse error (exit 2), not an add attempt."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--dpi", "0"])
+    assert excinfo.value.code == 2
+
+
 def test_file_add_text_mode_default_is_digital(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -564,6 +591,7 @@ def test_cluster_assigns_unassigned_files_to_docsets(
     assert payload["assignments"][fid] == {
         "docset": "Sample Documents",
         "confidence": None,
+        "review": False,
         "is_new": True,
     }
 

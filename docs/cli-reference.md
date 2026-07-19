@@ -267,9 +267,10 @@ successfully named) is still assigned. The command always exits `0`.
   "n_assigned_existing": 2,
   "n_new_clusters": 1,
   "assignments": {
-    "k7q3xb91pmrf": {"docset": "Contracts", "confidence": 0.83, "is_new": false},
-    "abc123def456": {"docset": "Receipts", "confidence": 0.71, "is_new": false}
-  }
+    "k7q3xb91pmrf": {"docset": "Contracts", "confidence": 0.83, "review": false, "is_new": false},
+    "abc123def456": {"docset": "Receipts", "confidence": 0.71, "review": false, "is_new": false}
+  },
+  "review_queue": []
 }
 ```
 
@@ -285,7 +286,8 @@ the incremental workflow:
 | `mode` | The effective run mode after resolving `auto` — `"fresh"` or `"incremental"`. |
 | `n_assigned_existing` | Number of files assigned to a DocSet that already existed before this run (the incremental "fit an existing cluster" case). |
 | `n_new_clusters` | Number of new DocSets created this run (emergent clusters that were LLM-named). |
-| `assignments` | Per-file detail: `docset` (final DocSet name), `confidence` (nearest-prototype confidence in `[0, 1]`, or `null` for emergent clusters), and `is_new` (whether the DocSet was created this run). |
+| `assignments` | Per-file detail: `docset` (final DocSet name), `confidence` (assignment confidence in `[0, 1]`, or `null` when the backend produced no score), `review` (abstain flag — `true` when the calibration / abstain gate is not confident enough to auto-accept, so the file should be routed to a human), and `is_new` (whether the DocSet was created this run). |
+| `review_queue` | Sorted list of the file ids whose `review` flag is set — the documents to route to a human. Empty unless a calibration abstain gate (`clustering.scenario.calibration`) or consolidation (`clustering.scenario.consolidation`) is configured. |
 
 LLM naming requires the same workspace setup as `--auto-classify`:
 
@@ -734,11 +736,11 @@ Errors across the group: `DOCSET_NOT_FOUND`, `FILE_NOT_FOUND`,
 
 ## File commands
 
-### `dgml file add <path> [--recursive] [--on-conflict POLICY] [--text-mode MODE] [--auto-classify]`
+### `dgml file add <path> [--recursive] [--on-conflict POLICY] [--text-mode MODE] [--dpi N] [--auto-classify]`
 
 Add a File. The source is copied into the workspace, hashed, its pages
-are rendered to 300 dpi PNGs via `gs`, and per-page word boxes are
-written to `page_text/` according to `--text-mode`.
+are rendered to PNGs via `gs` (300 dpi by default; see `--dpi`), and
+per-page word boxes are written to `page_text/` according to `--text-mode`.
 
 `<path>` is a `.pdf`, or a convertible source (`.docx`/`.doc`/`.xlsx`/`.xls`)
 when a converter is configured for its format family in the workspace
@@ -767,6 +769,13 @@ ignored when `<path>` is a single file.
 | `digital` (default) | Extract digital text from the PDF with `pdfminer.six`. A permanent text-extraction error is recorded for files with no digital text — the File record is still created (soft fail). |
 | `ocr` | Send each rendered page image to the cloud provider configured in `<workspace>/config.json`. Requires `pip install dgml[azure]` or `pip install dgml[aws]`. See "OCR configuration" below. |
 | `hybrid` | Run `digital` then `ocr` and merge the two per-page results by grouping words covering the same area into overlap regions (boxes overlap on IoU > 0.5 *or* one mostly contained in the other, so split/merge tokenization is resolved as a unit). Each region is resolved as a whole: OCR-only regions are kept; digital-only regions (no overlapping OCR) are assumed invisible to the human eye and dropped; mixed regions compare both sides' concatenated text by dash-normalized Levenshtein distance — if they agree (distance ≤ 2) digital wins (its characters come straight from the PDF font, more reliable than OCR even when OCR's tokenization is finer), and if they disagree OCR wins. A page whose digital text is mostly unresolved glyphs (pdfminer `(cid:N)` sentinels) falls back to OCR entirely. Default is silent — pass the global `--verbose` flag to surface per-page warnings and the merge summary on stderr. Requires the same `ocr` workspace config as `--text-mode ocr`. Optionally, an LLM can make the per-region decision instead of this heuristic — declare a `text_extraction` section in `config.json` (e.g. a local Ollama model); see [storage-layout.md](storage-layout.md#text_extraction-optional). Any LLM failure falls back to the heuristic for that page. |
+
+`--dpi N` sets the page-image render resolution (default `300`; must be a
+positive integer). Lowering it — e.g. `--dpi 150` — roughly halves
+rasterization time and `page_images/` disk use, and is usually ample for OCR
+and the downscaled clustering vision encoder; keep the default for archival
+fidelity. The value is recorded per-file as `page_image_dpi` and folded into
+the `DGML_PAGE_CACHE` key, so renders at different DPIs cache independently.
 
 Conflict types recorded in the success payload as `conflict_kind`:
 

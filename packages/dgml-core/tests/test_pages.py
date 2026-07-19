@@ -117,6 +117,23 @@ def test_cache_key_differs_by_content(
     assert len(calls) == 2
 
 
+def test_cache_key_differs_by_dpi(
+    tmp_path: Path, pdf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = tmp_path / "cache"
+    monkeypatch.setenv(PAGE_CACHE_ENV, str(cache))
+    monkeypatch.setattr(pages, "ghostscript_path", lambda: "gs")
+    calls: list[int] = []
+    monkeypatch.setattr(subprocess, "run", _fake_gs_factory(1, calls))
+
+    # Same bytes at two resolutions must not collide — the second render is a
+    # miss, not a false hit of the first.
+    render_pages(pdf, tmp_path / "a", dpi=300)
+    render_pages(pdf, tmp_path / "b", dpi=150)
+    assert len(calls) == 2
+    assert pages._pdf_cache_key(pdf, 300) != pages._pdf_cache_key(pdf, 150)
+
+
 def test_partial_cache_entry_is_treated_as_miss(
     tmp_path: Path, pdf: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -128,7 +145,7 @@ def test_partial_cache_entry_is_treated_as_miss(
 
     # A cache entry with PNGs but no `.complete` marker (e.g. an interrupted
     # writer) must not be trusted — render_pages should re-render.
-    entry = cache / pages._pdf_cache_key(pdf)
+    entry = cache / pages._pdf_cache_key(pdf, pages.DEFAULT_DPI)
     entry.mkdir(parents=True)
     (entry / "page_1.png").write_bytes(b"stale")
 

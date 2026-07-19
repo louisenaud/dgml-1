@@ -125,13 +125,14 @@ def _page_cache_root() -> Path | None:
     return Path(root) if root else None
 
 
-def _pdf_cache_key(pdf_path: Path) -> str:
+def _pdf_cache_key(pdf_path: Path, dpi: int) -> str:
     """Content hash keying the render cache: renderer + dpi + the PDF bytes.
 
     Renderer and dpi are folded in so a change to either invalidates entries
-    rather than serving mismatched renders for the same bytes.
+    rather than serving mismatched renders for the same bytes — a 150-dpi
+    render and a 300-dpi render of the same PDF get distinct cache entries.
     """
-    digest = hashlib.sha256(f"{RENDERER_NAME}:{DEFAULT_DPI}\n".encode())
+    digest = hashlib.sha256(f"{RENDERER_NAME}:{dpi}\n".encode())
     with pdf_path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             digest.update(chunk)
@@ -152,11 +153,17 @@ def _replace_pages_from(src_dir: Path, output_dir: Path) -> int:
 def render_pages(
     pdf_path: Path,
     output_dir: Path,
+    *,
+    dpi: int = DEFAULT_DPI,
 ) -> int:
-    """Render each PDF page to a PNG. Returns the number of pages written.
+    """Render each PDF page to a PNG at ``dpi``. Returns the number of pages written.
 
     Stale page images in ``output_dir`` are removed first so retries do not
     leave orphans behind.
+
+    ``dpi`` trades resolution for speed and disk: 300 (the default) is
+    archival quality; ~150 roughly halves rasterization time and file size and
+    is usually ample for OCR and the downscaled clustering vision encoder.
 
     When ``$DGML_PAGE_CACHE`` is set, an identical PDF (same bytes, renderer,
     and dpi) rendered before is served from that cache without invoking
@@ -171,7 +178,7 @@ def render_pages(
     cache_entry: Path | None = None
     cache_root = _page_cache_root()
     if cache_root is not None:
-        cache_entry = cache_root / _pdf_cache_key(pdf_path)
+        cache_entry = cache_root / _pdf_cache_key(pdf_path, dpi)
         if (cache_entry / _CACHE_COMPLETE_MARKER).exists():
             # Cache hit — no ghostscript needed (so it need not even be installed).
             return _replace_pages_from(cache_entry, output_dir)
@@ -189,7 +196,7 @@ def render_pages(
         "-dQUIET",
         "-dSAFER",
         "-sDEVICE=png16m",
-        f"-r{DEFAULT_DPI}",
+        f"-r{dpi}",
         f"-sOutputFile={output_template}",
         str(pdf_path),
     ]

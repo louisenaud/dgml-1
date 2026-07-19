@@ -141,6 +141,76 @@ def test_non_positive_temperature_raises() -> None:
         cluster_confidence(emb, labels, centroids, manifold, temperature=0.0)
 
 
+def test_invalid_temperature_string_raises() -> None:
+    manifold = _euclidean(dim=2)
+    emb = torch.zeros((1, 2))
+    labels = torch.zeros((1,), dtype=torch.long)
+    centroids = torch.tensor([[1.0, 0.0], [-1.0, 0.0]], dtype=torch.float32)
+    with pytest.raises(ValueError, match="temperature"):
+        cluster_confidence(emb, labels, centroids, manifold, temperature="nope")  # type: ignore[arg-type]
+
+
+# ── auto temperature: breaks the saturation that starves the selector ───────
+def test_auto_temperature_spreads_well_separated_blobs() -> None:
+    # The exact failure the demo hit: with T=1.0 every well-separated point
+    # pins at ~1.0 (no spread), so a bottom-quantile selector cannot rank them.
+    # "auto" rescales to the inter-centroid distance → a real spread appears.
+    emb = _three_blobs()
+    manifold = _euclidean()
+    labels, centroids = cluster_embeddings(emb, manifold=manifold, algorithm="kmeans", k=3)
+
+    raw = [float(c) for c in cluster_confidence(emb, labels, centroids, manifold)]  # type: ignore[arg-type]
+    auto = [
+        float(c)  # type: ignore[arg-type]
+        for c in cluster_confidence(emb, labels, centroids, manifold, temperature="auto")
+    ]
+
+    # T=1.0 saturates: no usable spread.
+    assert max(raw) - min(raw) < 1e-3
+    # auto gives the selector something to rank on.
+    assert max(auto) - min(auto) > 0.05
+    assert all(0.0 <= c <= 1.0 for c in auto)
+
+
+def test_auto_temperature_preserves_ordering() -> None:
+    # Rescaling the temperature must not reorder documents by confidence: a
+    # core point stays more confident than a boundary point under "auto".
+    manifold = _euclidean(dim=2)
+    emb = torch.tensor([[0.0, 0.0], [1.0, 0.0]], dtype=torch.float32)  # core, boundary
+    labels = torch.zeros((2,), dtype=torch.long)
+    centroids = torch.tensor([[0.0, 0.0], [2.0, 0.0]], dtype=torch.float32)
+
+    auto = [
+        float(c)  # type: ignore[arg-type]
+        for c in cluster_confidence(emb, labels, centroids, manifold, temperature="auto")
+    ]
+    assert auto[0] > auto[1]  # the point on top of its centroid is more confident
+
+
+def test_cluster_scores_shape_and_normalization() -> None:
+    from clustering.scenarios.clustering import cluster_scores
+
+    emb = _three_blobs(per=5)
+    manifold = _euclidean()
+    _, centroids = cluster_embeddings(emb, manifold=manifold, algorithm="kmeans", k=3)
+
+    scores = cluster_scores(emb, centroids, manifold, temperature="auto")
+    assert tuple(scores.shape) == (emb.shape[0], centroids.shape[0])
+    # Rows are softmax distributions.
+    assert torch.allclose(scores.sum(dim=-1), torch.ones(emb.shape[0]), atol=1e-5)
+
+
+def test_s1_populates_scores_for_margin_selection() -> None:
+    labels: list[str | None] = ["A", "A", "A", "A", "B", "B", "B", "B"]
+    result = build_scenario(_s1_config()).fit_predict(_InMemoryDataset(labels))
+    # S1 used to emit no scores; it now exposes the soft-assignment matrix so
+    # the consolidation 'margin' selector has per-cluster scores to work with.
+    assert result.scores is not None
+    assert result.scores.shape[0] == len(labels)
+    assert result.class_names is not None
+    assert result.scores.shape[1] == len(result.class_names)
+
+
 # ── S1 integration: ScenarioResult.confidence is populated ──────────────────
 class _InMemoryDataset(DocumentDataset):
     """Tiny corpus of two well-separated text "classes"."""

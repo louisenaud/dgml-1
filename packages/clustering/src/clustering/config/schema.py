@@ -155,6 +155,75 @@ class ManifoldConfig(_StrictModel):
         return self
 
 
+# ── Confidence calibration (§4.4) ───────────────────────────────────────────
+class CalibrationConfig(_StrictModel):
+    """Post-hoc calibration of the nearest-prototype confidence.
+
+    Off by default (``method="none"`` ⇒ the ordinal softmax-peak signal is
+    reported unchanged). ``temperature`` / ``platt`` are fit on the labeled
+    support set via leave-one-out (S3 / S5 only — S1 / S2 have no labels and
+    silently stay ordinal). ``coverage``, when set, adds a distribution-free
+    split-conformal abstain gate; ``abstain_threshold`` is an absolute
+    calibrated-confidence floor. Either gate flags a document for the review
+    queue without changing its predicted label."""
+
+    method: Literal["none", "temperature", "platt"] = "none"
+    coverage: float | None = None
+    """Target coverage in (0, 1) for the conformal abstain gate. ``None`` off."""
+    abstain_threshold: float | None = None
+    """Absolute calibrated-confidence floor in [0, 1]; below it ⇒ review."""
+
+
+# ── LLM consolidation of the low-confidence tail (§5) ────────────────────────
+class ConsolidationSelectorConfig(_StrictModel):
+    """Which assignments enter the LLM adjudication tail.
+
+    A document is selected iff the active ``strategy`` flags it, plus (when
+    ``include_noise``) any noise / unassigned document, all capped at
+    ``max_docs`` least-confident first so cost is bounded regardless of how
+    uncertain a run is."""
+
+    strategy: Literal["quantile", "confidence", "margin", "noise"] = "quantile"
+    quantile: float = 0.10
+    """Bottom fraction by (calibrated) confidence to select, for ``quantile``."""
+    confidence_threshold: float | None = None
+    """Select assignments with confidence below this, for ``confidence``."""
+    margin_threshold: float | None = None
+    """Select assignments whose top1-top2 probability gap is below this band,
+    for ``margin`` (needs per-class scores; degrades to ``quantile`` when
+    absent)."""
+    max_docs: int = 200
+    """Hard cap on adjudicated documents — the LLM cost ceiling."""
+    include_noise: bool = True
+    """Also adjudicate noise / unassigned (``-1`` / ``*_noise``) documents."""
+
+
+class ConsolidationConfig(_StrictModel):
+    """An optional LLM adjudication pass over the least-confident assignments.
+
+    Off by default and never on the hot path. When enabled, the selector picks
+    the low-confidence tail, an LLM adjudicates each against its nearest
+    candidate clusters (``candidates_k``), and verdicts are merged back through
+    the scenario's :meth:`~clustering.scenarios.base.Scenario.refine` hook. See
+    §5 of the roadmap."""
+
+    enabled: bool = False
+    selector: ConsolidationSelectorConfig = Field(default_factory=ConsolidationSelectorConfig)
+    candidates_k: int = 3
+    """Nearest existing clusters offered to the LLM per adjudicated document."""
+    mode: Literal["reassign", "repartition", "auto"] = "reassign"
+    """``reassign``: one candidate-pick decision per document. ``repartition``:
+    re-cluster a contested subset as a batch. ``auto``: repartition contested
+    regions, reassign the rest."""
+    batch_size: int = 40
+    """Repartition batch size (respects the LLM backend's MAX_BATCH_DOCS)."""
+    model: str | None = None
+    """Adjudication model. ``None`` ⇒ reuse the workspace classification model."""
+    apply: Literal["suggest", "auto"] = "suggest"
+    """``suggest``: emit verdicts for human review, labels unchanged.
+    ``auto``: write the reassignments into the result."""
+
+
 # ── Scenario ──────────────────────────────────────────────────────────────
 class ScenarioConfig(_StrictModel):
     name: ScenarioName
@@ -325,6 +394,20 @@ class ScenarioConfig(_StrictModel):
         "umap",
     ] = "none"
     reduce_dim: int = 0
+    # ── Ordinal confidence temperature (S1) ───────────────────────────────
+    confidence_temperature: float | Literal["auto"] = "auto"
+    """Softmax temperature for the S1 unsupervised ordinal confidence signal.
+
+    ``"auto"`` (default) scales it to the inter-centroid distance so
+    confidences spread across ``[1/C, 1]`` instead of saturating at ``1.0``
+    when clusters are well separated (e.g. after a UMAP reduction) — which is
+    what gives the consolidation selector a rankable signal instead of a column
+    of ties. A positive float pins an explicit temperature (``1.0`` = the raw
+    softmax-peak, pre-rescaling behavior)."""
+    # ── Confidence calibration + abstain (§4.4) ───────────────────────────
+    calibration: CalibrationConfig = Field(default_factory=CalibrationConfig)
+    # ── LLM consolidation of the low-confidence tail (§5) ─────────────────
+    consolidation: ConsolidationConfig = Field(default_factory=ConsolidationConfig)
 
 
 # ── Corpus ────────────────────────────────────────────────────────────────

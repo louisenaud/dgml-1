@@ -11,9 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Try incremental clustering with the novelty gate on a folder of documents.
+"""Try incremental clustering with the novelty gate, calibrated confidence,
+an abstain/review queue, and LLM consolidation — on a folder of documents.
 
-This is a hands-on demo of three things that fit together:
+This is a hands-on demo of the confidence stack that fits together:
 
 1. **Incremental clustering** — new documents are assigned to the nearest
    *existing* DocSet rather than clustered from scratch (scenarios S2/S3).
@@ -21,19 +22,26 @@ This is a hands-on demo of three things that fit together:
    well enough is routed to a fresh ``unknown_N`` bucket instead of being
    force-fit. Here we drive the *quantile* gate (``scenario.threshold_quantile``),
    the corpus-robust default: the ~``(1 - q)`` most-distant incoming docs are
-   treated as novel. Without a gate, incremental mode assigns *everything* to
-   its nearest DocSet and nothing is ever novel.
-3. **The per-document confidence signal** — every assignment now carries a
-   real confidence in ``[0, 1]`` (nearest-prototype softmax peak), so you can
-   see how sure each placement is instead of a column of ``null``.
+   treated as novel.
+3. **Per-document confidence** — every assignment carries a real confidence in
+   ``[0, 1]``; with ``--calibration`` it is temperature/Platt-calibrated on the
+   labeled support set (leave-one-out), not just the raw softmax peak.
+4. **Abstain / review queue** (``--coverage`` / ``--abstain-threshold``) — a
+   distribution-free conformal gate (or a plain floor) flags low-confidence
+   assignments for human review instead of silently accepting them.
+5. **Consolidation** (``--consolidate``) — a vision-LLM adjudication pass
+   reconsiders only the least-confident tail against its nearest candidate
+   clusters.
 
 Flow (a temporary, throwaway workspace by default):
 
     seed split ──fresh clustering──▶ initial DocSets
-    rest split ──incremental clustering + novelty gate──▶ assign-or-flag-novel
+    rest split ──incremental clustering + novelty gate + calibration──▶
+                 assign · flag-novel · flag-for-review · (optionally) consolidate
 
-The script prints, per incoming document, the DocSet it landed in, the
-assignment confidence, and whether the novelty gate flagged it as new.
+Note: calibration (temperature/Platt/conformal) is fit on the labeled support
+set, so it is active on the **incremental** (S3) pass only; the fresh seed pass
+(S1) is unsupervised and uses the ordinal confidence + an abstain floor.
 
 It is intentionally NOT part of the public ``dgml`` CLI surface — it is a
 demo / debugging tool.
@@ -42,13 +50,16 @@ Requirements:
   - the ``clustering`` extra: ``uv sync`` (installs torch, scikit-learn, …)
   - Ghostscript on PATH (page rendering at ingest); PDFs are read digitally.
   - An API key for the classification model used to *name* new DocSets
-    (default ``gemini/gemini-3.1-flash-lite`` ⇒ ``GEMINI_API_KEY``). Naming
-    failures are reported, not fatal — the clustering itself still runs.
+    (default ``gemini/gemini-3.1-flash-lite`` ⇒ ``GEMINI_API_KEY``); the same
+    model backs ``--consolidate``. Naming / consolidation failures are
+    reported, not fatal — the clustering itself still runs.
 
 Usage:
     uv run python scripts/try_incremental_novelty.py \
         --files-dir /path/to/samples/4-Infrastructure-Funds/files \
         [--quantile 0.8] [--seed-fraction 0.5] \
+        [--calibration temperature] [--coverage 0.9] [--abstain-threshold 0.5] \
+        [--consolidate] [--consolidate-apply suggest] [--consolidate-quantile 0.2] \
         [--model gemini/gemini-3.1-flash-lite] \
         [--workspace /tmp/demo-ws] [--keep] [--json]
 """
@@ -116,6 +127,55 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional cluster_algorithm override for the fresh seed pass "
         "(e.g. hdbscan, leiden, kmeans). Default: the bundled config's choice.",
     )
+    # ── Calibration + abstain (§4.4) ──────────────────────────────────────
+    p.add_argument(
+        "--calibration",
+        choices=["none", "temperature", "platt"],
+        default="none",
+        help="Calibrate the incremental (S3) confidence on the labeled support "
+        "set. 'none' keeps the ordinal softmax peak.",
+    )
+    p.add_argument(
+        "--coverage",
+        type=float,
+        default=None,
+        help="Conformal abstain gate: target coverage in (0, 1). Flags the "
+        "least-confident assignments for review to guarantee this coverage on "
+        "the kept set. Unset = no conformal gate.",
+    )
+    p.add_argument(
+        "--abstain-threshold",
+        type=float,
+        default=None,
+        help="Absolute calibrated-confidence floor in [0, 1]; assignments below "
+        "it are flagged for review. Composes with --coverage.",
+    )
+    # ── Consolidation (§5) ────────────────────────────────────────────────
+    p.add_argument(
+        "--consolidate",
+        action="store_true",
+        help="Run the LLM adjudication pass over the low-confidence tail on the "
+        "incremental step (needs an API key for --model).",
+    )
+    p.add_argument(
+        "--consolidate-apply",
+        choices=["suggest", "auto"],
+        default="suggest",
+        help="Consolidation: 'suggest' flags verdicts for review (labels "
+        "unchanged); 'auto' writes the reassignments.",
+    )
+    p.add_argument(
+        "--consolidate-quantile",
+        type=float,
+        default=0.2,
+        help="Bottom fraction of incremental assignments sent to LLM adjudication.",
+    )
+    p.add_argument(
+        "--consolidate-mode",
+        choices=["reassign", "repartition", "auto"],
+        default="reassign",
+        help="Consolidation adjudication mode.",
+    )
     p.add_argument("--recursive", action="store_true", help="Recurse into subdirectories.")
     p.add_argument("--keep", action="store_true", help="Keep the workspace after finishing.")
     p.add_argument("--json", action="store_true", help="Emit the raw result dicts as JSON.")
@@ -145,14 +205,37 @@ def _split(files: list[Path], seed_fraction: float) -> tuple[list[Path], list[Pa
     return files[:seed_n], files[seed_n:]
 
 
-def _write_config(config_path: Path, *, model: str, quantile: float, algorithm: str | None) -> None:
+def _write_config(config_path: Path, args: argparse.Namespace) -> None:
     """Seed <workspace>/config.json with the classification model (for naming
-    new DocSets) and the clustering novelty gate."""
-    scenario: dict[str, Any] = {"threshold_quantile": quantile}
-    if algorithm:
-        scenario["cluster_algorithm"] = algorithm
+    new DocSets + consolidation), the novelty gate, and — when requested — the
+    calibration and consolidation blocks (§4.4 / §5)."""
+    scenario: dict[str, Any] = {"threshold_quantile": args.quantile}
+    if args.seed_algorithm:
+        scenario["cluster_algorithm"] = args.seed_algorithm
+
+    if (
+        args.calibration != "none"
+        or args.coverage is not None
+        or args.abstain_threshold is not None
+    ):
+        calibration: dict[str, Any] = {"method": args.calibration}
+        if args.coverage is not None:
+            calibration["coverage"] = args.coverage
+        if args.abstain_threshold is not None:
+            calibration["abstain_threshold"] = args.abstain_threshold
+        scenario["calibration"] = calibration
+
+    if args.consolidate:
+        scenario["consolidation"] = {
+            "enabled": True,
+            "apply": args.consolidate_apply,
+            "mode": args.consolidate_mode,
+            "model": args.model,
+            "selector": {"strategy": "quantile", "quantile": args.consolidate_quantile},
+        }
+
     config = {
-        "classification": {"model": model},
+        "classification": {"model": args.model},
         "clustering": {"scenario": scenario},
     }
     config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
@@ -191,24 +274,34 @@ def _print_assignments(
         print("  (none)")
         return
     width = max((len(names.get(fid, fid)) for fid in assignments), default=8)
-    header = f"  {'document'.ljust(width)}  novel  conf   docset"
+    header = f"  {'document'.ljust(width)}  novel  review  conf   docset"
     print(header)
-    print(f"  {'-' * width}  -----  -----  ------")
-    # Novel (gate-flagged) first, then by ascending confidence.
+    print(f"  {'-' * width}  -----  ------  -----  ------")
+    # Flagged docs (novel or review) first, then by ascending confidence.
     for fid, detail in sorted(
         assignments.items(),
-        key=lambda kv: (not kv[1].get("is_new"), kv[1].get("confidence") or 0.0),
+        key=lambda kv: (
+            not (kv[1].get("is_new") or kv[1].get("review")),
+            kv[1].get("confidence") or 0.0,
+        ),
     ):
         name = names.get(fid, fid).ljust(width)
         novel = " NEW " if detail.get("is_new") else "  -  "
+        review = "REVIEW" if detail.get("review") else "  -   "
         conf = _fmt_conf(detail.get("confidence"))
-        print(f"  {name}  {novel}  {conf}  {detail.get('docset')}")
+        print(f"  {name}  {novel}  {review}  {conf}  {detail.get('docset')}")
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if not 0.0 < args.quantile < 1.0:
         raise SystemExit(f"error: --quantile must be in (0, 1); got {args.quantile}")
+    if args.coverage is not None and not 0.0 < args.coverage < 1.0:
+        raise SystemExit(f"error: --coverage must be in (0, 1); got {args.coverage}")
+    if args.abstain_threshold is not None and not 0.0 <= args.abstain_threshold <= 1.0:
+        raise SystemExit(
+            f"error: --abstain-threshold must be in [0, 1]; got {args.abstain_threshold}"
+        )
 
     try:
         from dgml_core.clustering import clustering
@@ -229,9 +322,7 @@ def main(argv: list[str] | None = None) -> int:
     ws_root = Path(tempfile.mkdtemp(prefix="dgml-novelty-")) if made_temp else args.workspace
     ws = Workspace(root=ws_root)
     ws.init()
-    _write_config(
-        ws.config_path, model=args.model, quantile=args.quantile, algorithm=args.seed_algorithm
-    )
+    _write_config(ws.config_path, args)
 
     print(f"Corpus:     {args.files_dir}  ({len(files)} files)")
     print(f"Workspace:  {ws_root}")
@@ -239,6 +330,17 @@ def main(argv: list[str] | None = None) -> int:
         f"Novelty gate: scenario.threshold_quantile = {args.quantile} "
         f"(≈ closest {args.quantile:.0%} kept as known, rest flagged novel)"
     )
+    cal_bits = [f"method={args.calibration}"]
+    if args.coverage is not None:
+        cal_bits.append(f"conformal coverage={args.coverage}")
+    if args.abstain_threshold is not None:
+        cal_bits.append(f"abstain<{args.abstain_threshold}")
+    print(f"Calibration:  {', '.join(cal_bits)}  (incremental S3 pass only)")
+    if args.consolidate:
+        print(
+            f"Consolidation: on — apply={args.consolidate_apply}, mode={args.consolidate_mode}, "
+            f"tail quantile={args.consolidate_quantile}"
+        )
 
     store = FileStore(ws)
 
@@ -287,10 +389,16 @@ def main(argv: list[str] | None = None) -> int:
     n_new = incr_result.get("n_new_clusters", 0)
     n_existing = incr_result.get("n_assigned_existing", 0)
     failed = incr_result.get("failed_file_ids", [])
+    review_queue = incr_result.get("review_queue", [])
     print(
         f"\nSummary: {n_existing} assigned to existing DocSets, "
         f"{n_new} flagged novel (new DocSets)."
     )
+    if review_queue:
+        review_docs = ", ".join(all_names.get(fid, fid) for fid in review_queue)
+        print(f"  review queue ({len(review_queue)}): {review_docs}")
+    else:
+        print("  review queue: empty (no assignment fell below the abstain gate)")
     if failed:
         print(f"  unclusterable / failed: {len(failed)} file(s): {failed}")
 

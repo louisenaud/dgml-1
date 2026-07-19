@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import torch
 
+from clustering.calibration import fit_support_calibrator
 from clustering.data.datasets import DocumentDataset
 from clustering.scenarios.base import Scenario, ScenarioResult
 from clustering.scenarios.clustering import assign_to_prototypes, manifold_kmeans
@@ -67,6 +68,18 @@ class S3PartialFewShot(Scenario):
         embeddings = self.projector(fused)
 
         sc = self.config.scenario
+        # Calibrate confidence on the labeled support set (leave-one-out), and
+        # decide abstention. No-op when calibration is off; falls back to the
+        # ordinal signal when the support set is too small to calibrate.
+        calibrator = fit_support_calibrator(
+            support_embeddings,
+            support_labels,
+            cats,
+            self.manifold,
+            method=sc.calibration.method,
+            coverage=sc.calibration.coverage,
+            abstain_threshold=sc.calibration.abstain_threshold,
+        )
         result = assign_to_prototypes(
             embeddings,
             known_protos,
@@ -74,14 +87,26 @@ class S3PartialFewShot(Scenario):
             threshold=sc.threshold,
             threshold_confidence=sc.threshold_confidence,
             threshold_quantile=sc.threshold_quantile,
+            calibrator=calibrator,
+            abstain_threshold=sc.calibration.abstain_threshold if calibrator is None else None,
         )
         labels_t, conf_t = result.labels, result.confidence
         labels_arr = labels_t.detach().numpy() if hasattr(labels_t, "numpy") else labels_t
-        conf_arr = conf_t.detach().numpy() if hasattr(conf_t, "numpy") else conf_t
+        # Prefer the calibrated confidence when a calibrator ran (it equals the
+        # ordinal signal otherwise), so downstream sees the calibrated score.
+        cal_t = result.calibrated_confidence if result.calibrated_confidence is not None else conf_t
+        conf_arr = cal_t.detach().numpy() if hasattr(cal_t, "numpy") else cal_t
+        abstain_t = result.abstain
+        abstain_arr = (
+            abstain_t.detach().numpy().tolist()
+            if abstain_t is not None and hasattr(abstain_t, "numpy")
+            else ([bool(x) for x in abstain_t.tolist()] if abstain_t is not None else None)
+        )
 
         # Same unknown-bucket clustering as S2.
         predictions: list[str | None] = [None] * len(doc_ids)
         confidence: list[float | None] = [None] * len(doc_ids)
+        review: list[bool] = [False] * len(doc_ids)
         unknown_idx = [i for i, li in enumerate(labels_arr.tolist()) if int(li) == -1]
         n_unknown = len(unknown_idx)
 
@@ -101,6 +126,8 @@ class S3PartialFewShot(Scenario):
             if int(li) != -1:
                 predictions[i] = cats[int(li)]
                 confidence[i] = float(conf_arr[i])
+                if abstain_arr is not None:
+                    review[i] = bool(abstain_arr[i])
 
         return ScenarioResult(
             run_id=self.run_id,
@@ -110,6 +137,7 @@ class S3PartialFewShot(Scenario):
             predictions=predictions,
             confidence=confidence,
             true_labels=true_labels,
+            review=review,
             metadata={
                 "categories": list(cats),
                 "n_shots": n_shots,
@@ -122,6 +150,8 @@ class S3PartialFewShot(Scenario):
                 "effective_threshold": result.effective_threshold,
                 "effective_confidence_threshold": result.effective_confidence_threshold,
                 "n_unknown": n_unknown,
+                "n_review": int(sum(review)),
+                "calibration": result.calibration,
                 "projector_trained": bool(train_history),
                 "projector_loss_history": train_history,
             },

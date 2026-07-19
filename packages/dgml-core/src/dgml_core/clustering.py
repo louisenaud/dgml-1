@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Any, Literal, get_args
 
 from .classification import (
+    ClassificationConfig,
     ClassificationDecision,
     load_classification_config,
     propose_new_docset_for_files,
@@ -167,6 +168,8 @@ class _InternalResult:
     clusters: dict[str, str]
     render_skipped: list[str]
     confidences: dict[str, float | None] = field(default_factory=dict)
+    # Per-file abstain flag (§4.4): True ⇒ route to the human review queue.
+    reviews: dict[str, bool] = field(default_factory=dict)
     mode: str = "fresh"
     method: str = "embedding"
     known_categories: list[str] = field(default_factory=list)
@@ -290,13 +293,19 @@ def clustering(
     - ``n_assigned_existing``: number of files assigned to a DocSet that
       already existed before this run (only meaningful for incremental).
     - ``n_new_clusters``: number of *new* DocSets created this run.
-    - ``assignments``: ``{file_id: {"docset", "confidence", "is_new"}}``
+    - ``assignments``: ``{file_id: {"docset", "confidence", "review", "is_new"}}``
       for every successfully-assigned file — ``confidence`` is the
       assignment confidence in ``[0, 1]``: the nearest-prototype softmax
       peak (incremental), the unsupervised clustering-geometry score
       (fresh / S1 emergent buckets), or the model's self-report (the ``llm``
       method). It is ``null`` only when the backend produced no score for a
-      file. ``is_new`` flags files that landed in a DocSet created this run.
+      file. ``review`` is the abstain flag (§4.4): ``True`` when the
+      calibration / abstain gate is not confident enough to auto-accept the
+      assignment. ``is_new`` flags files that landed in a DocSet created
+      this run.
+    - ``review_queue``: sorted list of the ``file_id``s whose ``review`` flag
+      is set — the documents to route to a human. Empty unless a calibration
+      abstain gate or consolidation is configured.
 
     ``skip_existing`` makes the whole call a no-op (returns ``skipped: True``,
     empty maps) when every file is already assigned — cheap to use on resume.
@@ -328,6 +337,7 @@ def clustering(
             "n_assigned_existing": 0,
             "n_new_clusters": 0,
             "assignments": {},
+            "review_queue": [],
         }
 
     internal = clustering_internal(
@@ -365,6 +375,7 @@ def clustering(
             assignments[file_id] = {
                 "docset": cluster_name,
                 "confidence": internal.confidences.get(file_id),
+                "review": internal.reviews.get(file_id, False),
                 "is_new": False,
             }
             if extraction_block is not None:
@@ -430,12 +441,17 @@ def clustering(
                     # the model's self-report for the LLM path. ``None`` only
                     # when the backend produced no score for this file.
                     "confidence": internal.confidences.get(file_id),
+                    "review": internal.reviews.get(file_id, False),
                     "is_new": True,
                 }
 
     n_assigned_existing = sum(
         1 for detail in assignments.values() if detail["docset"] in existing_names
     )
+    # The review queue (§4.4): every assigned file the abstain gate flagged as
+    # too-uncertain to auto-accept. Downstream (a HITL UI, an Inveniam.io
+    # reviewer) reads this to route those documents to a human.
+    review_queue = sorted(fid for fid, detail in assignments.items() if detail.get("review"))
     return {
         "clusters": clusters,
         "failed_file_ids": failed_file_ids,
@@ -444,6 +460,7 @@ def clustering(
         "n_assigned_existing": n_assigned_existing,
         "n_new_clusters": n_new_clusters,
         "assignments": assignments,
+        "review_queue": review_queue,
     }
 
 
@@ -568,6 +585,13 @@ def clustering_internal(
                 picked += 1
         max_shots = max(max_shots, picked)
 
+    # Consolidation (§5) is opt-in via the clustering config's
+    # ``scenario.consolidation`` block. When enabled, hand run_clustering a
+    # classification config so it can build the vision-LLM adjudicator; load it
+    # softly (a missing/invalid config just means consolidation is skipped —
+    # the embedding result stands, matching the never-raise philosophy).
+    classification_config = _maybe_classification_config(workspace, overrides)
+
     if support_file_ids:
         support_dataset = WorkspaceFileDataset(
             workspace, support_file_ids, labels=support_labels, text_view=text_view
@@ -578,22 +602,50 @@ def clustering_internal(
             n_samples_per_category=max_shots,
             support_dataset=support_dataset,
             overrides=overrides,
+            classification_config=classification_config,
+            debug=debug,
         )
     else:
         detailed = run_clustering_detailed(
-            dataset, known_categories=known_categories, overrides=overrides
+            dataset,
+            known_categories=known_categories,
+            overrides=overrides,
+            classification_config=classification_config,
+            debug=debug,
         )
 
     clusters = {doc_id: pred.cluster_name for doc_id, pred in detailed.items()}
     confidences = {doc_id: pred.confidence for doc_id, pred in detailed.items()}
+    reviews = {doc_id: pred.review for doc_id, pred in detailed.items()}
     return _InternalResult(
         clusters=clusters,
         render_skipped=skipped,
         confidences=confidences,
+        reviews=reviews,
         mode=effective_mode,
         method="embedding",
         known_categories=known_categories,
     )
+
+
+def _maybe_classification_config(
+    workspace: Workspace, overrides: dict[str, Any]
+) -> ClassificationConfig | None:
+    """Load the classification config iff consolidation is enabled.
+
+    Returns ``None`` when consolidation is off, or when the config is
+    missing / invalid (consolidation then quietly no-ops). This keeps the
+    embedding path free of any LLM/config requirement unless the operator
+    explicitly turned consolidation on.
+    """
+    scenario = overrides.get("scenario") if isinstance(overrides, dict) else None
+    consolidation = scenario.get("consolidation") if isinstance(scenario, dict) else None
+    if not (isinstance(consolidation, dict) and consolidation.get("enabled")):
+        return None
+    try:
+        return load_classification_config(workspace)
+    except DgmlError:
+        return None
 
 
 def _resolve_method(method: str, *, n_usable: int, threshold: int) -> str:

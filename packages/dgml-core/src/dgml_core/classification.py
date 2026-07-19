@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .docsets import DocSetStore
@@ -93,6 +93,11 @@ class ClassificationDecision:
     Exactly one of ``existing_docset_id`` or (``new_name``, ``new_description``,
     ``new_key_questions``) is populated. Validated at construction by
     :func:`classify_file`.
+
+    ``confidence`` is populated only by the multi-attempt path (see
+    :func:`propose_new_docset_for_files` with ``attempts >= 2``): it is the
+    agreement across independent attempts in ``[0, 1]`` — an ordinal signal,
+    not a calibrated probability.
     """
 
     decision: str  # "existing" | "new"
@@ -100,6 +105,7 @@ class ClassificationDecision:
     new_name: str | None = None
     new_description: str | None = None
     new_key_questions: tuple[str, ...] = ()
+    confidence: float | None = None
 
 
 def load_classification_config(workspace: Workspace) -> ClassificationConfig:
@@ -215,6 +221,7 @@ def propose_new_docset_for_files(
     *,
     config: ClassificationConfig,
     debug: bool = False,
+    attempts: int = 1,
 ) -> ClassificationDecision:
     """Ask the configured vision LLM to propose a new DocSet (name,
     description, and key questions) that ``file_ids`` should anchor.
@@ -227,22 +234,60 @@ def propose_new_docset_for_files(
     whole rather than a single example. The caller is responsible for
     capping ``file_ids`` if cost/context is a concern.
 
+    ``attempts`` controls the two-attempt-agreement confidence signal
+    (§4.4): with ``attempts == 1`` (default) a single call is made and the
+    returned decision carries no ``confidence``. With ``attempts >= 2`` the
+    proposal is requested independently that many times and the returned
+    decision (the first attempt's) carries a ``confidence`` equal to the
+    fraction of attempts that agreed on the proposed document-type name —
+    an ordinal robustness signal. A single hard failure across the attempts
+    still raises; agreement is computed only over successful attempts.
+
     Same failure contract as :func:`classify_file`: raises
     :class:`ClassificationFailed` for missing SDK / no page images on
     any of the files / malformed response / provider error, and
     :class:`AuthError` when ``config.api_key_env`` is set but the env
     var isn't.
     """
-    response = _vision_tool_call(
-        workspace,
-        file_ids,
-        config=config,
-        prompt=_build_prompt_new_only(),
-        tools=[_create_new_docset_tool()],
-        debug=debug,
-    )
-    name, args = _extract_single_tool_call(response)
-    return _parse_new_docset_args(name, args)
+    n_attempts = max(1, attempts)
+    decisions: list[ClassificationDecision] = []
+    for _ in range(n_attempts):
+        response = _vision_tool_call(
+            workspace,
+            file_ids,
+            config=config,
+            prompt=_build_prompt_new_only(),
+            tools=[_create_new_docset_tool()],
+            debug=debug,
+        )
+        name, args = _extract_single_tool_call(response)
+        decisions.append(_parse_new_docset_args(name, args))
+
+    if n_attempts == 1:
+        return decisions[0]
+    confidence = _name_agreement(decisions)
+    return replace(decisions[0], confidence=confidence)
+
+
+def _name_agreement(decisions: list[ClassificationDecision]) -> float:
+    """Agreement across attempts: the largest share that proposed the same
+    (normalized) document-type name, in ``(0, 1]``.
+
+    Case- and whitespace-insensitive so "PILOT Agreement" and "pilot
+    agreement" count as agreement. All-agree ⇒ ``1.0``; a 2-way split on two
+    attempts ⇒ ``0.5``.
+    """
+    names = [(_normalize_name(d.new_name)) for d in decisions if d.new_name]
+    if not names:
+        return 0.0
+    counts: dict[str, int] = {}
+    for nm in names:
+        counts[nm] = counts.get(nm, 0) + 1
+    return max(counts.values()) / len(names)
+
+
+def _normalize_name(name: str | None) -> str:
+    return " ".join((name or "").lower().split())
 
 
 def _vision_tool_call(

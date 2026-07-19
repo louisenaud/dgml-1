@@ -143,9 +143,12 @@ class FileStore:
         *,
         on_conflict: ConflictPolicy = ConflictPolicy.ERROR,
         text_mode: TextMode = TextMode.DIGITAL,
+        dpi: int = DEFAULT_DPI,
         verbose: bool = False,
         debug: bool = False,
     ) -> AddFileResult:
+        if dpi <= 0:
+            raise ValueError(f"dpi must be a positive integer; got {dpi!r}")
         if text_mode in (TextMode.OCR, TextMode.HYBRID):
             # Validate OCR config *before* touching the filesystem so a
             # rejected add leaves the workspace untouched. Hybrid needs OCR
@@ -208,6 +211,7 @@ class FileStore:
             original_path=original_path,
             conflict_kind=("hash" if same_hash else "path" if same_path else None),
             text_mode=text_mode,
+            dpi=dpi,
             verbose=verbose,
             debug=debug,
         )
@@ -261,6 +265,7 @@ class FileStore:
         original_path: str,
         conflict_kind: str | None,
         text_mode: TextMode,
+        dpi: int = DEFAULT_DPI,
         verbose: bool = False,
         debug: bool = False,
     ) -> AddFileResult:
@@ -295,7 +300,7 @@ class FileStore:
             )
 
         page_count, page_count_error = self._safe_page_count(pdf_path, file_id)
-        page_render_error = self._render_pages(pdf_path, file_id, expected=page_count)
+        page_render_error = self._render_pages(pdf_path, file_id, expected=page_count, dpi=dpi)
         text_extraction_error, text_summary = self._extract_text(
             pdf_path,
             file_id,
@@ -313,7 +318,7 @@ class FileStore:
             added_at=now_iso(),
             page_count=page_count,
             text_mode=text_mode.value,
-            page_image_dpi=DEFAULT_DPI,
+            page_image_dpi=dpi,
             page_image_renderer=RENDERER_NAME,
             pdf_converter=pdf_converter,
         )
@@ -392,11 +397,13 @@ class FileStore:
             )
             return None, message
 
-    def _render_pages(self, pdf_path: Path, file_id: str, *, expected: int | None) -> str | None:
+    def _render_pages(
+        self, pdf_path: Path, file_id: str, *, expected: int | None, dpi: int = DEFAULT_DPI
+    ) -> str | None:
         """Render pages, recording errors. Returns a human-readable error
         message on failure or partial success, or ``None`` on full success."""
         try:
-            rendered = render_pages(pdf_path, self.ws.file_pages_dir(file_id))
+            rendered = render_pages(pdf_path, self.ws.file_pages_dir(file_id), dpi=dpi)
         except PageRenderFailed as exc:
             append_recorded_error(
                 self.ws.file_errors_path(file_id),

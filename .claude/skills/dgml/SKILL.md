@@ -162,6 +162,7 @@ summing to `total`) is the quick health read; report it to the user.
 
 Variants:
 - **Add to an existing DocSet:** skip the `docset create` step; pass its known ID as `$ds`. Find it with `uv run dgml docset list | jq -r '.docsets[] | select(.name=="…") | .id'`.
+- **Speed up a large / scanned ingest:** page rendering (ghostscript at 300 dpi) dominates `file add` cost. Pass `--dpi 150` to roughly halve rasterization time and disk use — ample for OCR and clustering, and recorded per-file as `page_image_dpi`. Note `file add <dir>` processes files serially, so for a big corpus of single-page PDFs, fan out across files yourself: `find "$DIR" -type f -iname '*.pdf' -print0 | xargs -0 -P 8 -I{} uv run dgml file add {} --on-conflict skip --dpi 150` (safe — each file lands in its own record with no shared index).
 - **Auto-route heterogeneous PDFs into DocSets**: drop the `docset create` step and the `docset add-file` loop; pass `--auto-classify` to `file add` instead. Each file lands in the best-fitting existing DocSet, or in a new one the LLM proposes — and DocSets created mid-run are visible to later files in the same batch, so similar PDFs cluster. Requires `classification` config in `<workspace>/config.json`; see the one-shot example above. Read each file's `.results[].classification` block for the outcome.
 - **Recurse into subdirectories:** add `--recursive`.
 - **Hidden errors:** a PDF that fails to parse, render, or extract digital text still produces an entry — `soft_failed` (the `page_*`/`text_extraction_error` fields are set on its `file` entry) or `hard_failed` (the entry has an `error` object and no `file`). `dgml check` afterward is the authoritative whole-workspace health signal.
@@ -543,6 +544,23 @@ fi
 failed=$(jq -r '.failed_file_ids | length' <<<"$payload")
 if [ "$failed" -gt 0 ]; then
   echo "$failed file(s) couldn't be auto-clustered — see .failed_file_ids" >&2
+fi
+```
+
+Each entry in `.assignments` carries `docset`, `confidence` (in `[0, 1]`, or
+`null` when the backend produced no score), `is_new` (DocSet created this run),
+and `review` — an abstain flag set when the assignment is too uncertain to
+auto-accept. The file ids with `review: true` are collected, sorted, into the
+top-level `.review_queue`. It is empty unless a calibration abstain gate
+(`clustering.scenario.calibration`) or a consolidation pass
+(`clustering.scenario.consolidation`) is configured; when non-empty, surface it
+so a human can adjudicate the flagged documents rather than trusting the
+assignment silently.
+
+```bash
+review=$(jq -r '.review_queue | length' <<<"$payload")
+if [ "$review" -gt 0 ]; then
+  echo "$review assignment(s) flagged low-confidence for human review — see .review_queue" >&2
 fi
 ```
 

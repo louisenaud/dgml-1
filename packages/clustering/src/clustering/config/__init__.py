@@ -22,7 +22,10 @@ from __future__ import annotations
 
 from clustering.config.resolve import resolve
 from clustering.config.schema import (
+    CalibrationConfig,
     Config,
+    ConsolidationConfig,
+    ConsolidationSelectorConfig,
     CorpusConfig,
     EncoderConfig,
     FusionConfig,
@@ -33,7 +36,10 @@ from clustering.config.schema import (
 )
 
 __all__ = [
+    "CalibrationConfig",
     "Config",
+    "ConsolidationConfig",
+    "ConsolidationSelectorConfig",
     "CorpusConfig",
     "EncoderConfig",
     "FusionConfig",
