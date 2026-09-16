@@ -32,6 +32,7 @@ from dgml_core.migrations import (
     workspace_schema_version,
 )
 from dgml_core.run_clustering import DocPrediction
+from dgml_core.storage import ENV_VAR as WORKSPACE_ENV_VAR
 from dgml_core.storage import Workspace
 from dgml_core.workspaces_resolve import default_workspaces_store
 
@@ -67,7 +68,6 @@ def _init_ws(ws: Path) -> None:
     from dgml_core import workspace_config
 
     workspace = Workspace(root=ws.resolve())
-    workspace.init()
     workspace_config.write_identity(
         workspace,
         workspace_id="ws_testxxxxxxxxxxxx",
@@ -180,13 +180,16 @@ def test_workspace_create(tmp_path: Path, capsys: pytest.CaptureFixture[str]) ->
     assert payload["organization"] == "Acme"
     assert payload["name"] == "ws"  # defaults to the workspace directory name
     assert payload["config_present"] is True  # user config existed (init ran)
-    # A stable workspace_id is minted at create and echoed in the payload.
+    # A stable workspace_id is generated at create and echoed in the payload.
     workspace_id = payload["workspace_id"]
     assert workspace_id.startswith("ws_")
     # With no --storage it lands on the bundled default service.
     assert payload["storage_service"] == "default"
-    assert (ws / "docsets").is_dir()
-    assert (ws / "files").is_dir()
+    # `create` scaffolds nothing: stores build what they write into, so a brand-new
+    # workspace is its config plus workspace.json. This is what keeps a remote-backed
+    # workspace from getting empty local files/ and docsets/ it never uses.
+    assert not (ws / "docsets").exists()
+    assert not (ws / "files").exists()
     # The workspace config is now written by create and is authoritative for storage.
     assert (ws / "config.toml").exists()
     assert payload["workspace_config_path"] == str(ws / "config.toml")
@@ -218,7 +221,7 @@ def test_workspace_create_positional_path(
     assert rc == 0
     payload = _read_stdout(capsys)
     assert Path(payload["workspace"]) == ws.resolve()
-    assert (ws / "docsets").is_dir()
+    assert (ws / "config.toml").is_file()
 
     # The positional wins over a (differing) global --workspace.
     other = tmp_path / "other"
@@ -235,15 +238,15 @@ def test_workspace_create_positional_path(
     )
     assert rc == 0
     assert Path(_read_stdout(capsys)["workspace"]) == other.resolve()
-    assert (other / "docsets").is_dir()
-    assert not (tmp_path / "ignored" / "docsets").exists()
+    assert (other / "config.toml").is_file()
+    assert not (tmp_path / "ignored").exists()
 
 
 def test_create_without_a_path_is_listed_and_opens_by_id(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Naming no path puts the workspace in this machine's store of workspaces, and the
-    minted id can then be used anywhere a path can."""
+    generated id can then be used anywhere a path can."""
     rc = main(["workspace", "create", "--organization", "Acme", "--name", "A"])
     assert rc == 0
     created = _read_stdout(capsys)
@@ -287,14 +290,195 @@ def test_create_with_a_path_is_detached_and_not_listed(
 def test_an_unknown_id_is_an_error_not_a_new_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The id test is on shape, so an id-shaped argument the store does not hold is a
-    clear error. Under the old index-membership test it fell through to path
-    resolution and created a `ws_…` directory in the working directory."""
+    """An id-shaped argument that the store does not hold, and that names no existing
+    directory either, is a clear error. Letting it fall through to path resolution —
+    which is what the original index-membership test did — turned a typo'd id into a
+    new directory in the working directory."""
     monkeypatch.chdir(tmp_path)
     rc = main(["--workspace", "ws_abcdefghijklmnop", "status"])
     assert rc != 0
     assert _read_stderr(capsys)["error"]["code"] == "WORKSPACE_NOT_FOUND"
     assert not (tmp_path / "ws_abcdefghijklmnop").exists()
+
+    # Same for a prefix-free id: nothing about `ws_` is special any more.
+    assert main(["--workspace", "my-workspace", "status"]) != 0
+    assert _read_stderr(capsys)["error"]["code"] == "WORKSPACE_NOT_FOUND"
+    assert not (tmp_path / "my-workspace").exists()
+
+
+def test_create_with_a_chosen_id(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """`--id` sets the handle instead of generating one. It is the workspace's address and
+    the folder the store gives it, so all three have to agree."""
+    rc = main(["workspace", "create", "--organization", "Acme", "--id", "my-workspace"])
+    assert rc == 0
+    created = _read_stdout(capsys)
+    assert created["workspace_id"] == "my-workspace"
+    assert created["listed"] is True
+
+    store = default_workspaces_store()
+    assert store.list_ids() == ["my-workspace"]
+    assert Path(created["workspace"]).name == "my-workspace"
+
+    assert main(["--workspace", "my-workspace", "status"]) == 0
+    assert Path(_read_stdout(capsys)["workspace"]) == store.workspace_root("my-workspace")
+
+
+def test_a_leading_dot_slash_addresses_the_directory_not_the_listed_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A listed id shadows a same-named local directory, and `./name` is the escape — so
+    the `./` has to survive argparse. It does not under `type=Path`, which normalizes
+    `./notes` to `notes` and would silently hand back the workspace instead."""
+    assert main(["workspace", "create", "--organization", "Acme", "--id", "my-workspace"]) == 0
+    _read_stdout(capsys)
+
+    monkeypatch.chdir(tmp_path)
+    local = tmp_path / "my-workspace"
+    assert main(["workspace", "create", str(local), "--organization", "Local"]) == 0
+    _read_stdout(capsys)
+
+    assert main(["--workspace", "./my-workspace", "status"]) == 0
+    assert Path(_read_stdout(capsys)["workspace"]) == local.resolve()
+
+    assert main(["--workspace", "my-workspace", "status"]) == 0
+    listed = default_workspaces_store().workspace_root("my-workspace")
+    assert Path(_read_stdout(capsys)["workspace"]) == listed
+
+
+def test_create_with_an_id_ignores_an_unrelated_workspace_in_the_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A new listed workspace has nothing to do with whatever `Workspace.resolve` fell
+    back to, so a `./dgml-workspace` sitting in the working directory must not be read as
+    "the workspace this --id is renaming".
+
+    The regression: `create --id x` failed with INVALID_ARGUMENT wherever such a
+    directory existed, complaining that "this workspace" already had a different id —
+    while the identical command *without* `--id` generated one and ignored the directory."""
+    monkeypatch.chdir(tmp_path)
+    assert main(["workspace", "create", "./dgml-workspace", "--organization", "Old"]) == 0
+    bystander = _read_stdout(capsys)["workspace_id"]
+
+    assert main(["workspace", "create", "--id", "my-workspace", "--organization", "New"]) == 0
+    created = _read_stdout(capsys)
+    assert created["workspace_id"] == "my-workspace"
+    assert created["listed"] is True
+
+    # The directory that was merely in the way is untouched, and not listed.
+    store = default_workspaces_store()
+    assert store.list_ids() == ["my-workspace"]
+    assert bystander != "my-workspace"
+    assert f'workspace_id = "{bystander}"' in (
+        tmp_path / "dgml-workspace" / "config.toml"
+    ).read_text(encoding="utf-8")
+
+
+def test_create_refuses_an_id_the_store_already_holds(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A collision is a hard error, not an overwrite: the store's write is an upsert, so
+    proceeding would replace the existing workspace's config — losing its `[storage]`
+    binding while its corpus stayed where it was."""
+    assert main(["workspace", "create", "--organization", "Acme", "--id", "my-workspace"]) == 0
+    _read_stdout(capsys)
+    store = default_workspaces_store()
+    before = store.read_config("my-workspace")
+
+    rc = main(["workspace", "create", "--organization", "Other", "--id", "my-workspace"])
+    assert rc == 1
+    error = _read_stderr(capsys)["error"]
+    assert error["code"] == "CONFLICT"
+    assert "my-workspace" in error["message"]
+    assert store.read_config("my-workspace") == before
+
+
+@pytest.mark.parametrize("bad", ["MyWorkspace", "ab", "my/ws", "my.ws", "-ws"])
+def test_create_rejects_a_malformed_id(
+    bad: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Rejected before anything is written — an id decides the workspace's root, so
+    there is no half-built workspace to clean up afterwards."""
+    # `--id=<value>`, not `--id <value>`: argparse would read a leading hyphen as a flag.
+    rc = main(["workspace", "create", "--organization", "Acme", f"--id={bad}"])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "INVALID_ARGUMENT"
+    assert default_workspaces_store().list_ids() == []
+
+
+def test_create_with_a_chosen_id_detached(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A workspace addressed by path carries an id too — it is what `workspace import`
+    would later list it under — so `--id` applies there as well."""
+    ws = tmp_path / "ws"
+    assert (
+        main(["workspace", "create", str(ws), "--organization", "Acme", "--id", "my-workspace"])
+        == 0
+    )
+    created = _read_stdout(capsys)
+    assert created["workspace_id"] == "my-workspace"
+    assert created["listed"] is False
+    assert 'workspace_id = "my-workspace"' in (ws / "config.toml").read_text(encoding="utf-8")
+    assert (
+        json.loads((ws / "workspace.json").read_text(encoding="utf-8"))["workspace_id"]
+        == "my-workspace"
+    )
+
+
+def test_re_running_create_with_the_same_id_is_a_no_op(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`create` is documented as safe to re-run, so an `--id` that agrees with the id the
+    workspace already has must not be read as it colliding with itself."""
+    ws = tmp_path / "ws"
+    args = ["workspace", "create", str(ws), "--organization", "Acme", "--id", "my-workspace"]
+    assert main(args) == 0
+    _read_stdout(capsys)
+    assert main(args) == 0
+    assert _read_stdout(capsys)["workspace_id"] == "my-workspace"
+
+
+def test_create_will_not_re_identify_an_existing_workspace(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An id is how every other record refers to a workspace, so changing one is not
+    something `create` can do as a side effect of a re-run with a different flag."""
+    ws = tmp_path / "ws"
+    assert (
+        main(["workspace", "create", str(ws), "--organization", "Acme", "--id", "my-workspace"])
+        == 0
+    )
+    _read_stdout(capsys)
+
+    rc = main(["workspace", "create", str(ws), "--organization", "Acme", "--id", "other-workspace"])
+    assert rc == 1
+    error = _read_stderr(capsys)["error"]
+    assert error["code"] == "INVALID_ARGUMENT"
+    assert "my-workspace" in error["message"]
+    assert 'workspace_id = "my-workspace"' in (ws / "config.toml").read_text(encoding="utf-8")
+
+    # Someone passing --id meant to create a *new* workspace, so the message has to name
+    # what is pointing this command at the existing one — otherwise it reads as a flat
+    # refusal with nothing to act on.
+    assert "drop that path argument" in error["message"]
+
+
+def test_the_re_identify_error_names_how_the_workspace_was_addressed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Whatever pointed the command at the existing workspace is the thing the caller has
+    to stop doing, so the message names it rather than describing "this workspace"."""
+    assert main(["workspace", "create", "--organization", "Acme", "--id", "my-workspace"]) == 0
+    _read_stdout(capsys)
+
+    assert main(["--workspace", "my-workspace", "workspace", "create", "--id", "other"]) == 1
+    assert "--workspace 'my-workspace'" in _read_stderr(capsys)["error"]["message"]
+
+    monkeypatch.setenv(WORKSPACE_ENV_VAR, "my-workspace")
+    assert main(["workspace", "create", "--id", "other"]) == 1
+    message = _read_stderr(capsys)["error"]["message"]
+    assert f"${WORKSPACE_ENV_VAR}" in message
+    assert f"unset {WORKSPACE_ENV_VAR}" in message
 
 
 def test_workspace_list(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -332,7 +516,7 @@ def test_workspace_list_does_not_show_a_workspace_addressed_by_path(
 
 
 def test_open_backfills_a_missing_id(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """A legacy workspace with no workspace_id gets one minted into workspace.json and
+    """A legacy workspace with no workspace_id gets one generated into workspace.json and
     mirrored into its config on first open — no manual step, idempotent on a second."""
     from dgml_core import workspace_config
 
@@ -340,7 +524,7 @@ def test_open_backfills_a_missing_id(tmp_path: Path, capsys: pytest.CaptureFixtu
     # an older schema version so the backfill migration runs. It has a config.toml
     # (every workspace does) but no identity block yet.
     ws = Workspace(root=tmp_path / "legacy")
-    ws.init()
+    ws.root.mkdir(parents=True)
     ws.config_path.write_text('[storage]\nprovider = "dgml_core.storage_local:LocalStore"\n')
     ws.write_meta(name="legacy", organization="Acme")
     stamp_schema_version(ws, 0)
@@ -353,7 +537,7 @@ def test_open_backfills_a_missing_id(tmp_path: Path, capsys: pytest.CaptureFixtu
 
     # The id is mirrored into config.toml so it is readable without the store. Read it
     # through a fresh Workspace: config text is memoized per object, and this one was
-    # constructed before the command that wrote it (see Workspace._config_state).
+    # constructed before the command that wrote it (see Workspace.config_text).
     assert workspace_config.read_identity(Workspace(root=ws.root)).workspace_id == wid
 
     # Second open: id unchanged.
@@ -369,7 +553,7 @@ def test_a_cloned_directory_keeps_its_id_and_opens_by_path(
     machine's store: the id travels with the directory, and what a machine *lists* is
     now a deliberate choice rather than a side effect of opening something."""
     ws = Workspace(root=tmp_path / "cloned")
-    ws.init()
+    ws.root.mkdir(parents=True)
     ws.config_path.write_text('[storage]\nprovider = "dgml_core.storage_local:LocalStore"\n')
     wid = "ws_clonedaaaaaaaaaa"
     ws.write_meta(name="Cloned", organization="Acme", workspace_id=wid)
@@ -476,7 +660,14 @@ def test_deleting_the_workspace_config_is_a_clean_error(
 
     Workspace(root=ws).config_path.unlink()
     assert main(_ws_args(ws) + ["status"]) == 1
-    assert _read_stderr(capsys)["error"]["code"] == "STORAGE_CONFIG_INVALID"
+    # Reported as WORKSPACE_NOT_INITIALIZED, not a separate config error: having a
+    # config *is* being a workspace, so the two are one check. Nothing on disk
+    # distinguishes "config deleted" from "never a workspace" for a remote-backed
+    # workspace anyway, so the message carries both remedies.
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "WORKSPACE_NOT_INITIALIZED"
+    assert "config.toml is missing" in err["message"]
+    assert "restore the config from backup" in err["message"]
 
 
 def test_config_storage_edit_trips_the_seal(
@@ -610,7 +801,7 @@ def test_workspace_list_rows_are_derived_from_each_config(
     store = default_workspaces_store()
     found = store.read_config(wid)
     assert found is not None
-    store.write_config(wid, found[0].replace('name = "', 'name = "Renamed '))
+    store.write_config(wid, found.replace('name = "', 'name = "Renamed '))
     main(["workspace", "list"])
     rows = {r["workspace_id"]: r for r in _read_stdout(capsys)["workspaces"]}
     assert rows[wid]["name"].startswith("Renamed ")
@@ -673,8 +864,7 @@ def test_workspace_create_without_prior_init_warns_but_succeeds(
     assert payload["config_present"] is False
     assert "next_action" in payload
     # Workspace was created regardless.
-    assert (ws / "docsets").is_dir()
-    assert (ws / "files").is_dir()
+    assert (ws / "config.toml").is_file()
     # The user config was NOT created by workspace create.
     assert not user_config_path().exists()
     # Warning always on stderr (no --verbose needed).
@@ -965,7 +1155,9 @@ def test_file_add_rejects_nonpositive_dpi(tmp_path: Path, text_pdf: Path) -> Non
         with pytest.raises(SystemExit) as exc:
             main(_ws_args(ws) + ["file", "add", str(text_pdf), "--dpi", bad])
         assert exc.value.code == 2
-    assert not list((ws / "files").iterdir())
+    # Nothing written: the directory is created by the first write, so a rejected
+    # add should leave it absent entirely.
+    assert not (ws / "files").exists() or not list((ws / "files").iterdir())
 
 
 @needs_gs
@@ -1758,6 +1950,278 @@ def test_file_add_without_auto_classify_omits_block(
     assert rc == 0
     payload = _read_stdout(capsys)
     assert "classification" not in payload
+
+
+def _seed_docset_and_config(
+    ws: Path, capsys: pytest.CaptureFixture[str], name: str = "Contracts"
+) -> str:
+    """One DocSet plus a classification config; returns the DocSet id.
+
+    Note `--auto-classify existing` skips the LLM against a single-DocSet
+    workspace — use :func:`_seed_two_docsets_and_config` for tests that need
+    the model path.
+    """
+    main(
+        _ws_args(ws)
+        + [
+            "docset",
+            "create",
+            "--name",
+            name,
+            "--key-question",
+            "What is the agreement date?",
+            "--key-question",
+            "Who are the parties?",
+        ]
+    )
+    existing_id: str = _read_stdout(capsys)["id"]
+    write_classification_config(
+        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+    )
+    return existing_id
+
+
+def _seed_two_docsets_and_config(ws: Path, capsys: pytest.CaptureFixture[str]) -> tuple[str, str]:
+    """Two DocSets plus a classification config, so assign-only classification
+    has a real choice to make and actually calls the LLM. Returns both ids."""
+    first = _seed_docset_and_config(ws, capsys)
+    main(
+        _ws_args(ws)
+        + [
+            "docset",
+            "create",
+            "--name",
+            "Safety Datasheets",
+            "--key-question",
+            "What substance does this cover?",
+        ]
+    )
+    second: str = _read_stdout(capsys)["id"]
+    return first, second
+
+
+@needs_gs
+def test_file_add_auto_classify_explicit_existing_or_new_matches_bare(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--auto-classify existing-or-new` is the bare flag said out loud: same
+    tool menu, same decision."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    existing_id = _seed_docset_and_config(ws, capsys)
+    response = _tool_response("assign_to_existing_docset", {"docset_id": existing_id})
+
+    with patch("litellm.completion", return_value=response) as mock_completion:
+        rc = main(
+            _ws_args(ws) + ["file", "add", str(sample_pdf), "--auto-classify", "existing-or-new"]
+        )
+    assert rc == 0
+    cls = _read_stdout(capsys)["classification"]
+    assert cls["decision"] == "existing"
+    assert cls["docset_id"] == existing_id
+    offered = [t["function"]["name"] for t in mock_completion.call_args.kwargs["tools"]]
+    assert offered == ["assign_to_existing_docset", "create_new_docset"]
+
+
+@needs_gs
+def test_file_add_auto_classify_existing_assigns(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The assign tool is the *only* one offered, so the LLM has no way to
+    create a DocSet and no way to decline — the file lands in the curated set
+    and that set never grows."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    existing_id, other_id = _seed_two_docsets_and_config(ws, capsys)
+    response = _tool_response("assign_to_existing_docset", {"docset_id": existing_id})
+
+    with patch("litellm.completion", return_value=response) as mock_completion:
+        rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--auto-classify", "existing"])
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    cls = payload["classification"]
+    assert cls["performed"] is True
+    assert cls["decision"] == "existing"
+    assert cls["docset_id"] == existing_id
+    assert cls["docset_created"] is False
+    assert cls["error"] is None
+    offered = [t["function"]["name"] for t in mock_completion.call_args.kwargs["tools"]]
+    assert offered == ["assign_to_existing_docset"]
+
+    rc = main(_ws_args(ws) + ["docset", "list-files", existing_id])
+    assert rc == 0
+    assert _read_stdout(capsys)["file_ids"] == [payload["file"]["id"]]
+
+    # No third DocSet appeared — only the two that were seeded.
+    rc = main(_ws_args(ws) + ["docset", "list"])
+    assert rc == 0
+    assert sorted(d["id"] for d in _read_stdout(capsys)["docsets"]) == sorted(
+        [existing_id, other_id]
+    )
+
+
+@needs_gs
+def test_file_add_auto_classify_existing_single_docset_skips_llm(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One DocSet and no option to decline means one possible answer, so the
+    file is assigned without a vision call. The payload is the same one the
+    model would have produced."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    only_id = _seed_docset_and_config(ws, capsys)
+
+    with patch("litellm.completion") as mock_completion:
+        rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--auto-classify", "existing"])
+    assert rc == 0
+    mock_completion.assert_not_called()
+
+    payload = _read_stdout(capsys)
+    cls = payload["classification"]
+    assert cls["performed"] is True
+    assert cls["decision"] == "existing"
+    assert cls["docset_id"] == only_id
+    assert cls["docset_created"] is False
+    assert cls["error"] is None
+
+    # The assignment is real, not just reported.
+    rc = main(_ws_args(ws) + ["docset", "list-files", only_id])
+    assert rc == 0
+    assert _read_stdout(capsys)["file_ids"] == [payload["file"]["id"]]
+
+
+@needs_gs
+def test_file_add_auto_classify_default_mode_single_docset_still_calls_llm(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The shortcut is assign-only. With creation allowed, one DocSet is not
+    one answer — the LLM still decides whether the file belongs in it."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    only_id = _seed_docset_and_config(ws, capsys)
+    response = _tool_response("assign_to_existing_docset", {"docset_id": only_id})
+
+    with patch("litellm.completion", return_value=response) as mock_completion:
+        rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--auto-classify"])
+    assert rc == 0
+    mock_completion.assert_called_once()
+    assert _read_stdout(capsys)["classification"]["decision"] == "existing"
+
+
+@needs_gs
+def test_file_add_auto_classify_existing_errors_when_no_docsets(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Nothing to assign to → hard error (exit 1) and no LLM call. The mode
+    must place the file in an existing DocSet, so with none there is no
+    outcome; silently leaving the file unassigned is what it exists to
+    prevent."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    write_classification_config(
+        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+    )
+
+    with patch("litellm.completion") as mock_completion:
+        rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--auto-classify", "existing"])
+    assert rc == 1
+    err = _read_stderr(capsys)
+    assert err["error"]["code"] == "NO_EXISTING_DOCSETS"
+    assert "docset create" in err["error"]["message"]
+    mock_completion.assert_not_called()
+
+    # The precondition is checked before ingesting: a failed run must not
+    # leave behind the unassigned file this mode exists to prevent.
+    rc = main(_ws_args(ws) + ["file", "list"])
+    assert rc == 0
+    assert _read_stdout(capsys)["files"] == []
+
+
+@needs_gs
+def test_file_add_auto_classify_default_mode_handles_empty_workspace(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The NO_EXISTING_DOCSETS precondition is specific to `existing` mode —
+    the bare flag still creates the workspace's first DocSet."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    write_classification_config(
+        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+    )
+    response = _tool_response(
+        "create_new_docset",
+        {
+            "name": "Receipts",
+            "description": "expense receipts",
+            "key_questions": ["Who?", "How much?", "When?"],
+        },
+    )
+
+    with patch("litellm.completion", return_value=response):
+        rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--auto-classify"])
+    assert rc == 0
+    assert _read_stdout(capsys)["classification"]["decision"] == "new"
+
+
+@needs_gs
+def test_file_add_auto_classify_existing_hard_fails_when_no_config(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The classification config is a precondition in `existing` mode too."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    with patch("litellm.completion") as mock_completion:
+        rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--auto-classify", "existing"])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "CLASSIFICATION_CONFIG_MISSING"
+    mock_completion.assert_not_called()
+
+
+def test_file_add_auto_classify_rejects_unknown_mode(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as excinfo:
+        main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--auto-classify", "bogus"])
+    assert excinfo.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+
+
+def test_file_add_auto_classify_before_path_is_rejected(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--auto-classify takes an optional MODE, so argparse consumes the next
+    token. `--auto-classify <path>` therefore fails loudly rather than
+    silently reading the path as a mode — the one invocation form that changed
+    when the flag stopped being a boolean. `choices=` is what makes it loud;
+    dropping it would turn this into a confusing "path is required"."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as excinfo:
+        main(_ws_args(ws) + ["file", "add", "--auto-classify", str(sample_pdf)])
+    assert excinfo.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+
+    # The documented spelling — path first — still works.
+    capsys.readouterr()
+    existing_id = _seed_docset_and_config(ws, capsys)
+    with patch(
+        "litellm.completion",
+        return_value=_tool_response("assign_to_existing_docset", {"docset_id": existing_id}),
+    ):
+        rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--auto-classify", "existing"])
+    assert rc == 0
 
 
 def _init_with_docset(ws: Path, capsys: pytest.CaptureFixture[str], name: str = "X") -> str:
@@ -2727,6 +3191,113 @@ def test_file_add_directory_auto_classify_amortizes_docsets(
     assert len(docsets) == 1
     main(_ws_args(ws) + ["docset", "list-files", new_id])
     assert len(_read_stdout(capsys)["file_ids"]) == 2
+
+
+def test_file_add_directory_auto_classify_existing_assigns_every_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Bulk run in `existing` mode: every file is assigned within the curated
+    set — including one the LLM only picks as the closest available — and the
+    set never grows."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    existing_id, other_id = _seed_two_docsets_and_config(ws, capsys)
+
+    src = tmp_path / "pdfs"
+    src.mkdir()
+    _write_text_pdf(src / "a.pdf", ["Alpha page one", "Alpha page two"])
+    _write_text_pdf(src / "b.pdf", ["Bravo page one", "Bravo page two"])
+
+    def fake_completion(**kwargs: Any) -> SimpleNamespace:
+        # The assign tool is the only one offered, on every call — that is
+        # what leaves the LLM no way to create a DocSet or decline.
+        assert [t["function"]["name"] for t in kwargs["tools"]] == ["assign_to_existing_docset"]
+        return _tool_response("assign_to_existing_docset", {"docset_id": existing_id})
+
+    with patch("litellm.completion", side_effect=fake_completion) as mock_completion:
+        rc = main(_ws_args(ws) + ["file", "add", str(src), "--auto-classify", "existing"])
+    assert rc == 0
+    assert mock_completion.call_count == 2  # per file; no shortcut with two DocSets
+    payload = _read_stdout(capsys)
+    assert payload["summary"]["added"] == 2
+    assert payload["summary"]["soft_failed"] == 0
+
+    for entry in payload["results"]:
+        assert entry["classification"]["decision"] == "existing"
+        assert entry["classification"]["docset_id"] == existing_id
+        assert entry["classification"]["docset_created"] is False
+        assert entry["classification"]["error"] is None
+
+    # Still exactly the two curated DocSets, one of them holding both files.
+    main(_ws_args(ws) + ["docset", "list"])
+    assert sorted(d["id"] for d in _read_stdout(capsys)["docsets"]) == sorted(
+        [existing_id, other_id]
+    )
+    main(_ws_args(ws) + ["docset", "list-files", existing_id])
+    assert len(_read_stdout(capsys)["file_ids"]) == 2
+
+
+def test_file_add_directory_auto_classify_existing_single_docset_skips_llm(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The shortcut holds for every file in a bulk run: assign-only mode never
+    creates a DocSet, so a single-DocSet workspace stays single-DocSet and no
+    file ever has a choice to make."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    only_id = _seed_docset_and_config(ws, capsys)
+
+    src = tmp_path / "pdfs"
+    src.mkdir()
+    _write_text_pdf(src / "a.pdf", ["Alpha page one"])
+    _write_text_pdf(src / "b.pdf", ["Bravo page one"])
+
+    with patch("litellm.completion") as mock_completion:
+        rc = main(_ws_args(ws) + ["file", "add", str(src), "--auto-classify", "existing"])
+    assert rc == 0
+    mock_completion.assert_not_called()
+
+    payload = _read_stdout(capsys)
+    assert payload["summary"]["added"] == 2
+    for entry in payload["results"]:
+        assert entry["classification"]["decision"] == "existing"
+        assert entry["classification"]["docset_id"] == only_id
+        assert entry["classification"]["docset_created"] is False
+        assert entry["classification"]["error"] is None
+
+    main(_ws_args(ws) + ["docset", "list-files", only_id])
+    assert len(_read_stdout(capsys)["file_ids"]) == 2
+
+
+def test_file_add_directory_auto_classify_existing_aborts_before_adding(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The no-DocSets precondition is checked once up front, so a bulk run
+    aborts before any file is added rather than on the first one."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    write_classification_config(
+        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+    )
+
+    src = tmp_path / "pdfs"
+    src.mkdir()
+    _write_text_pdf(src / "a.pdf", ["Alpha page one"])
+    _write_text_pdf(src / "b.pdf", ["Bravo page one"])
+
+    with patch("litellm.completion") as mock_completion:
+        rc = main(_ws_args(ws) + ["file", "add", str(src), "--auto-classify", "existing"])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "NO_EXISTING_DOCSETS"
+    mock_completion.assert_not_called()
+
+    # Nothing was ingested — the abort happened before the first add.
+    rc = main(_ws_args(ws) + ["file", "list"])
+    assert rc == 0
+    assert _read_stdout(capsys)["files"] == []
 
 
 def test_file_add_directory_auto_classify_hard_fails_without_config(
@@ -5112,9 +5683,9 @@ def test_create_is_idempotent_and_preserves_identity(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """`workspace create` is documented as safe to re-run. That means it must reuse the
-    identity its config already records, not mint a fresh one.
+    identity its config already records, not generate a fresh one.
 
-    Regression: it minted unconditionally, so re-running forked `workspace_id` and left
+    Regression: it generated unconditionally, so re-running forked `workspace_id` and left
     two index rows for one directory — and run on a second machine against a shared
     config it changed the whole organization's workspace identity, including the
     `workspace` record in the remote doc store.
@@ -5191,7 +5762,7 @@ def test_import_sweeps_the_legacy_index_without_moving_data(
     main(["workspace", "list"])
     assert {r["workspace_id"] for r in _read_stdout(capsys)["workspaces"]} == {id_a, id_b}
     assert (a / "config.toml").is_file()
-    assert (b / "docsets").is_dir()
+    assert (b / "config.toml").is_file()
 
     # ...and each opens by id, from the directory it was already in.
     assert main(["--workspace", id_a, "status"]) == 0
@@ -5305,7 +5876,7 @@ def test_import_refuses_a_directory_with_no_config(
     """A directory with the right shape is not a workspace. Import can reconstruct a
     missing config — assuming local disk when nothing recorded a binding — but it cannot
     invent an *identity*: with no `workspace.json` and no legacy row there is nothing to
-    import this as, and minting an id would adopt an arbitrary directory as a workspace."""
+    import this as, and generating an id would adopt an arbitrary directory as a workspace."""
     bare = tmp_path / "bare"
     (bare / "docsets").mkdir(parents=True)
     (bare / "files").mkdir()
@@ -5586,7 +6157,7 @@ def _legacy_workspace(
     """A workspace as an older dgml left it: initialized, no `config.toml`, its binding
     (or not) recorded only in the per-machine index. Returns the id it was given.
 
-    The id is **minted**, not written as a literal: a hand-typed id is easy to get subtly
+    The id is **generated**, not written as a literal: a hand-typed id is easy to get subtly
     wrong (16 characters from [a-z2-7] exactly), and one character off silently produces a
     workspace nothing can address — which is the very failure the malformed-id test below
     covers. Pass ``workspace_id`` only to construct that bad case deliberately."""
@@ -5597,7 +6168,6 @@ def _legacy_workspace(
     workspace_id = workspace_id or new_workspace_id()
 
     ws = Workspace(root=root)
-    ws.init()
     ws.write_meta(name="Legacy", organization="Acme", workspace_id=workspace_id)
     ws.config_path.unlink(missing_ok=True)
 
@@ -5675,14 +6245,16 @@ def test_a_plain_command_never_invents_a_binding(
     _legacy_workspace(root, with_storage_snapshot=False)
 
     assert main(_ws_args(root) + ["status"]) == 1
-    assert _read_stderr(capsys)["error"]["code"] == "STORAGE_CONFIG_INVALID"
+    # One guard now: having a config *is* being a workspace, so a missing config
+    # reports WORKSPACE_NOT_INITIALIZED rather than a separate storage error.
+    assert _read_stderr(capsys)["error"]["code"] == "WORKSPACE_NOT_INITIALIZED"
     assert not (root / "config.toml").exists()
 
 
 def test_import_refuses_a_malformed_workspace_id(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """An id that is not `ws_` + 16 base32 chars addresses nothing: the local backend
+    """An id that could not be a directory name addresses nothing: the local backend
     filters its folders by that same test, so importing would write a config into a
     directory `workspace list` never looks at and `--workspace <id>` never resolves.
     Reporting "imported" for that would be a silent no-op dressed as success.
@@ -5690,7 +6262,8 @@ def test_import_refuses_a_malformed_workspace_id(
     dgml's generator only ever emits well-formed ids, so this is hand-edited — hence a
     refusal that names both places to correct, and leaves the legacy index in place."""
     root = tmp_path / "handedited"
-    _legacy_workspace(root, workspace_id="ws_tooshort", with_storage_snapshot=True)  # 9 chars
+    # A dot is not a legal id character — this can only be a hand edit.
+    _legacy_workspace(root, workspace_id="ws_hand.edited", with_storage_snapshot=True)
 
     assert main(["workspace", "import"]) == 2
     payload = _read_stdout(capsys)
@@ -5703,3 +6276,166 @@ def test_import_refuses_a_malformed_workspace_id(
 
     assert registry.registry_path().is_file()
     assert payload["imported"] == []
+
+
+# --------------------------------------------------------------------------
+# `dgml file add --id` — caller-supplied document ids.
+# These lock the JSON/exit-code contract; the rule matrix itself is covered in
+# dgml-core's test_files.py.
+# --------------------------------------------------------------------------
+
+
+@needs_gs
+def test_file_add_id_flag_sets_id(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    assert main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--id", "my-report"]) == 0
+    payload = _read_stdout(capsys)
+    assert payload["file"]["id"] == "my-report"
+    assert payload["created"] is True
+    assert (ws / "files" / "my-report").is_dir()
+
+    assert main(_ws_args(ws) + ["file", "show", "my-report"]) == 0
+    assert _read_stdout(capsys)["id"] == "my-report"
+
+
+@pytest.mark.parametrize("bad", ["My_Report", "ab", "a b", "a/b"])
+def test_file_add_id_rejects_malformed(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str], bad: str
+) -> None:
+    """Exit 1 with a structured envelope — not argparse's exit 2."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--id", bad])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "INVALID_ARGUMENT"
+    assert not (ws / "files").exists()
+
+
+def test_file_add_id_uppercase_uuid_rejected(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A lowercase UUID is a valid id, so an uppercase one is the likely mistake.
+    It must come back as a structured envelope, and the message must say the rule
+    (letters lowercase) rather than leaving the caller to guess."""
+    import uuid
+
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--id", str(uuid.uuid4()).upper()])
+    assert rc == 1
+    err = _read_stderr(capsys)
+    assert err["error"]["code"] == "INVALID_ARGUMENT"
+    assert "lowercase" in err["error"]["message"]
+
+
+@needs_gs
+def test_file_add_id_conflict_envelope(
+    tmp_path: Path, sample_pdf: Path, sample_pdf_alt: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--id", "doc-1"])
+    original_sha = _read_stdout(capsys)["file"]["sha256"]
+
+    rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf_alt), "--id", "doc-1"])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "CONFLICT"
+
+    # The held record survived — the whole point of the id guard.
+    main(_ws_args(ws) + ["file", "show", "doc-1"])
+    assert _read_stdout(capsys)["sha256"] == original_sha
+
+
+def test_file_add_id_rejected_for_directory(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    src = tmp_path / "batch"
+    src.mkdir()
+    shutil.copy2(sample_pdf, src / "a.pdf")
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["file", "add", str(src), "--id", "one-id"])
+    assert rc == 1
+    err = _read_stderr(capsys)
+    assert err["error"]["code"] == "INVALID_ARGUMENT"
+    assert "directory" in err["error"]["message"]
+
+    # The bulk run must never have started.
+    main(_ws_args(ws) + ["file", "list"])
+    assert _read_stdout(capsys)["files"] == []
+
+
+@needs_gs
+def test_file_add_id_idempotent_readd_with_skip(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--id", "doc-1"])
+    capsys.readouterr()
+
+    rc = main(
+        _ws_args(ws) + ["file", "add", str(sample_pdf), "--id", "doc-1", "--on-conflict", "skip"]
+    )
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    assert payload["created"] is False
+    assert payload["file"]["id"] == "doc-1"
+
+    main(_ws_args(ws) + ["file", "list"])
+    assert len(_read_stdout(capsys)["files"]) == 1
+
+
+@needs_gs
+def test_file_add_id_unsatisfiable_under_skip(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The content is already present under a generated id, so `skip` would return
+    a record that is not the one the caller named."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
+    capsys.readouterr()
+
+    rc = main(
+        _ws_args(ws) + ["file", "add", str(sample_pdf), "--id", "other", "--on-conflict", "skip"]
+    )
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "INVALID_ARGUMENT"
+
+
+@needs_gs
+def test_file_add_id_duplicate_creates_second(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
+    capsys.readouterr()
+
+    rc = main(
+        _ws_args(ws)
+        + ["file", "add", str(sample_pdf), "--id", "copy-2", "--on-conflict", "duplicate"]
+    )
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    assert payload["created"] is True
+    assert payload["file"]["id"] == "copy-2"
+
+    main(_ws_args(ws) + ["file", "list"])
+    assert len(_read_stdout(capsys)["files"]) == 2

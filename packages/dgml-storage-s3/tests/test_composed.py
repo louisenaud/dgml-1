@@ -62,7 +62,6 @@ def mixed_workspace(_fake_mongo: None, tmp_path: Path) -> Workspace:
         encoding="utf-8",
     )
     ws = Workspace(root=root)
-    ws.init()
     return ws
 
 

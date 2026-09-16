@@ -84,6 +84,22 @@ def test_list_is_sorted_and_prefix_scoped(blobs: S3BlobStore) -> None:
     ]
 
 
+def test_keys_with_separator_ids_round_trip(blobs: S3BlobStore) -> None:
+    """Caller-supplied ids may contain `-` and `_` (`file add --id`), and an id
+    is a key segment — prefix scoping must not confuse two similar ones."""
+    blobs.put_blob("files/invoice_2024_q1/report.pdf", b"a")
+    blobs.put_blob("files/invoice_2024_q1/page_images/page_1.png", b"b")
+    blobs.put_blob("files/invoice_2024/report.pdf", b"c")
+    assert blobs.get_blob("files/invoice_2024_q1/report.pdf") == b"a"
+    assert blobs.list_blobs("files/invoice_2024_q1/") == [
+        "files/invoice_2024_q1/page_images/page_1.png",
+        "files/invoice_2024_q1/report.pdf",
+    ]
+    blobs.delete_blobs("files/invoice_2024_q1/")
+    assert blobs.list_blobs("files/invoice_2024_q1/") == []
+    assert blobs.get_blob("files/invoice_2024/report.pdf") == b"c"
+
+
 def test_list_and_delete_paginate_past_1000(blobs: S3BlobStore) -> None:
     # The single most important wire behaviour the in-process fake still models:
     # list_objects_v2 caps at 1000 keys, so a naive one-page read silently drops.

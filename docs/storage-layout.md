@@ -20,16 +20,24 @@ element can span pages.
 The root is determined in this order:
 
 1. `--workspace <path-or-id>` CLI flag (or `Workspace.resolve(<path-or-id>)` in
-   code). The argument is a filesystem path **or** a `ws_…` workspace id, decided by
-   **shape**: an id is `ws_` followed by exactly 16 base32-lowercase characters
-   (`[a-z2-7]` — so no separator, no dot, no uppercase, and never `0`, `1`, `8` or
-   `9`). Anything else is a path.
+   code). The argument is a filesystem path **or** a workspace id. Since an id needs no
+   distinguishing prefix (`my-workspace` is as valid as a generated `ws_qf7imkc7f6oqzfwt`)
+   it is also a legal directory name, so the two are told apart in four steps:
 
-   An id is looked up in [the store of workspaces](#the-store-of-workspaces); one it
-   does not hold is an error (`WORKSPACE_NOT_FOUND`), **not** a path. That is the point
-   of testing shape rather than membership: the same argument cannot mean a workspace on
-   one machine and a directory to create on another. A directory whose name happens to
-   be id-shaped is still addressable as `./ws_…`, which fails the test on the `./`.
+   1. **Not a well-formed id** — it carries a separator, a dot, an uppercase letter, or
+      is outside 3–40 characters — so it is a path. No store is built to decide this,
+      and it is what keeps `./my-workspace` addressing the directory.
+   2. **[The store of workspaces](#the-store-of-workspaces) holds it** → that workspace.
+   3. **A directory of that name exists** → a path. This is the same cwd-relative
+      reading a path argument has always had, so nothing about `--workspace notes`
+      moves.
+   4. **Neither** → `WORKSPACE_NOT_FOUND`, naming both places looked in.
+
+   Step 4 is the important one: falling through to path resolution would turn a typo'd
+   id into a new directory in the working directory. And because step 2 precedes step 3,
+   a listed id always wins over a same-named local directory — no `mkdir` can redirect a
+   working command at a different workspace — with `./name` as the escape for addressing
+   the directory.
 2. The `DGML_HOME` environment variable — also either a path or an id.
 3. Default: `./dgml-workspace` (relative to the current working directory).
 
@@ -53,13 +61,19 @@ config merges across layers.
 
 ## Directory structure
 
+Only for a workspace whose data is on local disk, and **only what has been written**:
+nothing is pre-created. `workspace create` writes `config.toml` and `workspace.json`;
+`docsets/` and `files/` appear when the first docset or file lands in them. A workspace
+whose blobs and documents both live on a remote backend has no `docsets/` or `files/`
+at all — see [storage services](#storage-services-storage).
+
 ```
 <workspace_root>/
 ├── workspace.json                    # { name, organization, workspace_id, schema_version } — written by `workspace create`
 ├── config.toml                       # storage binding + settings — REQUIRED
 ├── usage.jsonl                       # LLM call event log (optional)
 ├── docsets/
-│   └── <docset_id>/                  # 12-char base-36 ID
+│   └── <docset_id>/                  # generated: 12-char base-36 ID
 │       ├── docset.json               # { id, name, description, key_questions }
 │       ├── extraction-schema.rnc      # grounded extraction schema, RELAX NG Compact (optional)
 │       ├── extraction-guidance.md     # docset-level extraction guidance shown to the LLM (optional)
@@ -74,7 +88,7 @@ config merges across layers.
 │   ├── embeddings/                   #   excluded from the blob namespace and safe to delete
 │   └── staging/                      #   in-flight batch writes (page renders, text extraction)
 └── files/
-    └── <file_id>/                    # 12-char base-36 ID
+    └── <file_id>/                    # generated, or set by `file add --id`
         ├── <original_filename>       # source copied in (a .pdf, or a
         │                             #   convertible source like .docx/.xlsx)
         ├── <stem>.pdf                # converted PDF — only when the source was
@@ -91,19 +105,28 @@ config merges across layers.
         └── errors.json               # recorded fatal errors (optional)
 ```
 
-IDs are 12 lowercase alphanumerics — `~62` bits of entropy each, generated
-with `secrets.choice` ([packages/dgml/src/dgml/ids.py](../packages/dgml/src/dgml/ids.py)).
+A generated ID is 12 lowercase alphanumerics — `~62` bits of entropy each, from
+`secrets.choice`
+([packages/dgml-core/src/dgml_core/ids.py](../packages/dgml-core/src/dgml_core/ids.py)).
+
+A File ID can also be **set by the caller** with `dgml file add --id`: 3 to 40
+characters using only lowercase letters, digits, hyphens and underscores, starting with a
+letter or digit. The generated form is a strict subset of that, so both shapes are valid
+everywhere an ID appears.
+
+DocSet IDs are always generated today.
 
 ## Page-image render cache (`$DGML_PAGE_CACHE`, optional)
 
-Rendering `page_images/` shells out to ghostscript, which dominates the cost
-of `dgml file add`. The render is a pure function of the PDF bytes, the
-renderer, and the dpi, so when the **`DGML_PAGE_CACHE`** environment variable
-names a directory, the renderer keys each render by a hash of all three and
-reuses it:
+Rendering `page_images/` runs the configured renderer (the system
+ghostscript binary by default, or PDFium via `[pdf] provider =
+"pypdfium2"`), which dominates the cost of `dgml file add`. The render is a
+pure function of the PDF bytes, the renderer, and the dpi, so when the
+**`DGML_PAGE_CACHE`** environment variable names a directory, the renderer
+keys each render by a hash of all three and reuses it:
 
 - **Hit** — an identical PDF rendered before is copied from the cache and
-  ghostscript is not invoked (it need not even be installed).
+  the render backend is not invoked (it need not even be installed).
 - **Miss** — the PDF is rendered normally, then copied into the cache. A
   `.complete` marker is written last, so an interrupted write reads as a miss
   rather than a partial hit.
@@ -128,10 +151,13 @@ The workspace identity, written by `dgml workspace create`:
 }
 ```
 
-- `workspace_id` — the workspace's **stable handle** (`ws_` + 16 lowercase
-  base32 chars, 80 bits from `secrets`). Opaque and non-semantic, so it survives a
-  directory rename. Minted at `workspace create` and carried here so the directory
-  self-describes; it is also how [the store of workspaces](#the-store-of-workspaces) keys it.
+- `workspace_id` — the workspace's **stable handle**: 3 to 40 characters using only
+  lowercase letters, digits, hyphens and underscores
+  starting with a letter or digit, so it is always a safe single path segment. Generated at
+  `workspace create` as `ws_` + 16 lowercase base32 chars (80 bits from `secrets`) —
+  opaque and non-semantic, so it survives a directory rename — or set outright with
+  `workspace create --id my-workspace`. Carried here so the directory self-describes;
+  it is also how [the store of workspaces](#the-store-of-workspaces) keys it.
   A workspace created before this field existed is given one automatically the
   first time any command opens it (a schema migration). `dgml --workspace <workspace_id>`
   opens the workspace by this id.
@@ -178,8 +204,12 @@ The parent is `$DGML_WORKSPACES` when set, else `[workspaces] root`, else
 source documents and page images rather than settings.
 
 The folder name *being* the `workspace_id` is what makes this work with no index: there
-is nothing to keep in sync, and a directory whose name is not a well-formed id is simply
-not a workspace, so a stray file in the parent is ignored rather than half-listed.
+is nothing to keep in sync. A folder is listed only if it **holds a `config.toml`** — the
+config being the record — and only if its name could be a `workspace_id` at all, so
+neither a stray `notes.bak/` nor a loose file in the parent is half-listed. Note the name
+test alone is weak now that an id needs no prefix (a plain lowercase folder name is a
+well-formed id, which is exactly what `workspace create --id my-workspace` produces);
+it is the `config.toml` that decides.
 
 ### MongoDB
 
@@ -242,10 +272,11 @@ it can be deleted.
 
 ## The workspace config (`config.toml`)
 
-Every workspace has a `config.toml`. It is **required**: it names the workspace's
-storage backend, so an initialized workspace without one fails with
-`STORAGE_CONFIG_INVALID` rather than silently falling back to local disk — an absent
-config is indistinguishable from a remote-backed workspace whose config was deleted.
+Every workspace has a `config.toml`. It is **required**, and it is what *makes* a
+directory a workspace: it names the storage backend, so a directory without one fails
+with `WORKSPACE_NOT_INITIALIZED` rather than silently falling back to local disk — an
+absent config is indistinguishable from a remote-backed workspace whose config was
+deleted, and both want the same answer from the caller.
 
 Where it lives depends on how the workspace is addressed: `<workspace>/config.toml` for
 one addressed by path, and inside [the store of workspaces](#the-store-of-workspaces)
@@ -666,8 +697,10 @@ code `STYLE_CONFIG_INVALID`. A disabled section is never validated, so shipping
 
 ### `clustering` (optional)
 
-Overrides for the bundled clustering defaults used by `dgml cluster`
-(and the auto-cluster step of `dgml file add --auto-classify`). The
+Overrides for the bundled clustering defaults used by `dgml cluster`.
+(`dgml file add --auto-classify` does *not* read this section — it
+classifies one file at a time via the `classification` section below,
+and never runs the clustering pipeline.) The
 shipped defaults live in
 [packages/dgml-core/src/dgml_core/clustering_config.json](../packages/dgml-core/src/dgml_core/clustering_config.json)
 and stand on their own — this section only needs to spell out the
@@ -957,13 +990,16 @@ each contain one file per page.
 overlap, OCR wins on conflict).
 
 `page_image_dpi` and `page_image_renderer` record how `page_images/` were
-rendered — the renderer is currently always `"ghostscript"`; the dpi is `300`
+rendered — the renderer is `"ghostscript"` (the default) or `"pypdfium2"`,
+per the workspace's `[pdf] provider` config at add time; the dpi is `300`
 unless `dgml file add --dpi N` set otherwise. They are stored per file both so
 a later renderer change is detectable and because they are load-bearing: the
 dpi is the scale of every `page_text/` word box (see below), and `dgml check
---retry-errors` re-renders and re-extracts at the *recorded* value so a repair
-reproduces the file's existing geometry instead of today's default. They are
-`null` if a non-PDF source failed to convert (no page images were produced).
+--retry-errors` re-renders and re-extracts at the *recorded* dpi **with the
+recorded renderer**, so a repair reproduces the file's existing pixels
+instead of today's config (backends differ subtly in anti-aliasing and ±1 px
+dimension rounding). They are `null` if a non-PDF source failed to convert
+(no page images were produced).
 
 `pdf_converter` names the converter that turned a non-PDF source into the
 PDF the pipeline ran on (the converter's name with any trailing

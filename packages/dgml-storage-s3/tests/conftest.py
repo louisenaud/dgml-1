@@ -121,5 +121,4 @@ def s3_blobs_workspace(tmp_path: Path) -> Workspace:
         encoding="utf-8",
     )
     ws = Workspace(root=root)
-    ws.init()  # blobs → S3, docs → local disk
     return ws

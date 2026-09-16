@@ -49,6 +49,7 @@ from dgml_core.generation.to_semantic import (
     render_semantic_xml,
 )
 from dgml_core.generation.transcribe import transcribe_document
+from dgml_core.pages import PdfConfig
 from dgml_core.storage import Workspace
 from dgml_core.usage import OPERATION_LABEL, OPERATION_TRANSCRIBE
 
@@ -130,6 +131,10 @@ class ConvertOptions:
     # `conversion` config. Passed to load_document_as_pdf so non-PDF inputs
     # convert; None/empty means PDF-only (every input must already be a PDF).
     converters: dict[str, ConverterConfig] | None = None
+    # PDF engine for page slicing (the per-window transcription payload), from
+    # the workspace `pdf` config. None means the ghostscript default — which is
+    # also what library callers with no workspace get.
+    pdf_config: PdfConfig | None = None
     # Optional full-fidelity schema seed (from --schema-path or the docset's
     # own schema.json on an incremental run). Seeds the roster with role
     # descriptions, curated examples, kind, and hierarchy; Pass B.1 planning
@@ -227,6 +232,7 @@ def convert_batch(
                 debug=opts.debug,
                 log=log,
                 page_text_dir=(opts.page_text_dirs or {}).get(path.name),
+                pdf_config=opts.pdf_config,
             )
         except Exception as exc:
             log(f"[transcribe] {path.name} FAILED: {exc}; skipping")

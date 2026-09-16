@@ -22,7 +22,7 @@ From inside this repo, use `uv run dgml …` (the venv is managed by `uv sync`).
 
 The workspace root is picked in this order:
 
-1. `--workspace <path-or-id>` flag — a filesystem path **or** a `ws_…` workspace id
+1. `--workspace <path-or-id>` flag — a filesystem path **or** a workspace id
    from `dgml workspace list`
 2. `$DGML_HOME` — also either form
 3. `./dgml-workspace`, relative to cwd — the last resort, and note that **nothing
@@ -30,10 +30,13 @@ The workspace root is picked in this order:
    workspace in the store of workspaces instead. It is what keeps a workspace made by
    an older dgml (or by `create <path>`) working, not a directory to expect.
 
-`--workspace` and `$DGML_HOME` each take a **path or a `ws_…` id**, told apart by shape
-(an id is `ws_` + exactly 16 chars from `[a-z2-7]`). An id is looked up in the machine's
-**store of workspaces**; one it does not hold fails with `WORKSPACE_NOT_FOUND` rather
-than being treated as a path to create.
+`--workspace` and `$DGML_HOME` each take a **path or a workspace id** (3–40 chars from
+lowercase letters, digits, hyphens and underscores, starting with a letter or digit — a generated `ws_…` or a chosen
+`my-workspace`). Since an id can also be a directory name, they are told apart by
+looking: a value the machine's **store of workspaces** holds is that workspace, an
+existing directory of that name is a path, and a value that is neither fails with
+`WORKSPACE_NOT_FOUND` rather than being treated as a path to create. A listed id wins
+over a same-named directory — address the directory as `./name`.
 
 The workspace's `config.toml` is **required** — it names the storage backend — and lives
 either in the workspace's own directory (a workspace addressed by path) or in the store
@@ -45,13 +48,13 @@ of workspaces (one addressed by id). There is no flag for pointing at one kept e
 Setup — the minimum is a **single** command:
 
 1. `dgml init [--provider <anthropic|google|mixed>]` — **run once per machine.** Writes the user-level `~/.config/dgml/config.toml` with a `[models]` block. Omit `--provider` to auto-detect from the API-key env vars that are set (`ANTHROPIC_API_KEY` / `GEMINI_API_KEY`); pass `--force` to overwrite an existing file (backs it up first). There are **no** default models — an unconfigured model is a hard error, never a silent paid call.
-2. `dgml workspace create [path] --organization <org>` — creates the workspace (`docsets/` + `files/`), writes its `config.toml` (the storage binding plus a machine-managed `[workspace]` identity block), records its identity in `workspace.json`, and mints a stable `workspace_id` (echoed in the payload). **Where it goes depends on whether you name a place for it**: with no `path`, no `--workspace` and no `$DGML_HOME`, the workspace is created in the machine's store of workspaces and is listed by `dgml workspace list` (`"listed": true`); give a `path` (`dgml workspace create ./ws …`) and you get a **detached** workspace in that directory, addressed by path and not listed. Prefer the listed form for new work — `--workspace <id>` then opens it from any directory. It does **not** touch the user config; if the config is missing it still creates the workspace and warns on stderr to run `dgml init`. Safe to re-run — an existing `[storage.<name>]` is never overwritten and the recorded id, name and `created_at` are reused. `--organization` is **required for a new workspace** and is embedded in its docset namespace URIs (`http://dgml.io/<org>/<DocSetSlug>`); it becomes **optional** once the config records one (passing a different value re-organizes the workspace and warns on stderr). `--name` is an optional human-readable label. Use `--storage <name>` to materialize a named service defined as `[storage.<name>]` in the user config into this workspace's own config (omit for the bundled local-disk default); `--from-config <path>` starts from a config you authored, copied in verbatim (a template — the source is not tracked, and later edits to it do nothing). The two **compose**: `--from-config` supplies the config, `--storage` says which `[storage.<name>]` table in it to bind to — a config declaring `[storage.acme]` needs `--storage acme`, or create fails with `INVALID_ARGUMENT` rather than silently using local disk.
+2. `dgml workspace create [path] --organization <org>` — creates the workspace — writing its `config.toml` (the storage binding plus a machine-managed `[workspace]` identity block), records its identity in `workspace.json`, and generates a stable `workspace_id` (echoed in the payload). **Where it goes depends on whether you name a place for it**: with no `path`, no `--workspace` and no `$DGML_HOME`, the workspace is created in the machine's store of workspaces and is listed by `dgml workspace list` (`"listed": true`); give a `path` (`dgml workspace create ./ws …`) and you get a **detached** workspace in that directory, addressed by path and not listed. Prefer the listed form for new work — `--workspace <id>` then opens it from any directory. It does **not** touch the user config; if the config is missing it still creates the workspace and warns on stderr to run `dgml init`. Safe to re-run — an existing `[storage.<name>]` is never overwritten and the recorded id, name and `created_at` are reused. `--organization` is **required for a new workspace** and is embedded in its docset namespace URIs (`http://dgml.io/<org>/<DocSetSlug>`); it becomes **optional** once the config records one (passing a different value re-organizes the workspace and warns on stderr). `--name` is an optional human-readable label. `--id <workspace_id>` sets the stable handle instead of generating one (3 to 40 characters using only lowercase letters, digits, hyphens and underscores, starting with a letter or digit, e.g. `--id my-workspace`) — use it when the id is decided elsewhere or a workspace is being re-created deterministically; an id the store already holds fails with `CONFLICT`, an `--id` matching the workspace's existing id is a no-op, and one that differs from it fails with `INVALID_ARGUMENT` (`create` never re-identifies a workspace). Use `--storage <name>` to materialize a named service defined as `[storage.<name>]` in the user config into this workspace's own config (omit for the bundled local-disk default); `--from-config <path>` starts from a config you authored, copied in verbatim (a template — the source is not tracked, and later edits to it do nothing). The two **compose**: `--from-config` supplies the config, `--storage` says which `[storage.<name>]` table in it to bind to — a config declaring `[storage.acme]` needs `--storage acme`, or create fails with `INVALID_ARGUMENT` rather than silently using local disk.
 
 **Per-workspace config overrides need a config that is a file.** `workspace_config_path` (from `workspace create` or `dgml status`) is the path to append a section like `[ocr]` or `[generation]` to — and it is `null` when the store of workspaces does not keep configs as files (the Mongo backend does not; `config_location` names where it is instead). In that case put the section in the user config, which every workspace layers over, or supply it at create time with `--from-config`. Recipes below guard on this rather than appending blindly: `jq -r` renders a JSON null as the string `null`, so an unguarded `cat >> "$cfg"` silently writes a file called `null` and the setting never takes effect.
 
-**A workspace's `config.toml` is required and must travel with it** — it is the only record of which storage backend holds the data. A workspace whose config is missing fails with `STORAGE_CONFIG_INVALID`; do not delete it, and copy it along when moving a *detached* workspace's directory.
+**A workspace's `config.toml` is required and must travel with it** — it is the only record of which storage backend holds the data. A workspace whose config is missing fails with `WORKSPACE_NOT_INITIALIZED` — having a config is what being a workspace means; do not delete it, and copy it along when moving a *detached* workspace's directory.
 
-A `ws_…` id is not visible in the filesystem the way a path is, so **in a new shell recover it with `dgml workspace list`** rather than guessing. The recipes below pass `--workspace "$wid"` on every command, which is what works when each command runs in its own shell (as agents usually run them); at an interactive prompt `export DGML_HOME=<id>` once is equivalent and shorter. dgml never sets that variable for you.
+A workspace id is not visible in the filesystem the way a path is, so **in a new shell recover it with `dgml workspace list`** rather than guessing (unless you set it yourself with `workspace create --id`, which is the reason to). The recipes below pass `--workspace "$wid"` on every command, which is what works when each command runs in its own shell (as agents usually run them); at an interactive prompt `export DGML_HOME=<id>` once is equivalent and shorter. dgml never sets that variable for you.
 
 Managing multiple workspaces: `dgml workspace list` prints every workspace the store of workspaces holds (`{workspace_id, name, organization, storage_service, root, created_at}`), and any `workspace_id` opens it from anywhere — e.g. `id=$(dgml workspace create --organization Acme | jq -r .workspace_id)` then `dgml --workspace "$id" file list`. Every field is derived from each workspace's own config, so a row cannot disagree with the workspace it describes. A **detached** workspace is not in the store of workspaces and so not listed; `dgml workspace import <path>` adds one, and `dgml workspace import` with no arguments sweeps every workspace an older dgml left in `~/.config/dgml/workspaces.json` (data never moves — the existing directory is recorded as `workspace_path`, which does not re-seal the workspace). A workspace whose `config.toml` is missing gets one reconstructed: from the legacy row's `storage` snapshot when it has one, else local disk is assumed and reported (`assumed_local_storage`). A directory with no workspace identity, or a hand-edited malformed `workspace_id`, is refused with the fix named — the legacy index is never deleted, so nothing is lost. (`dgml workspace register` has been removed.)
 
@@ -136,7 +139,47 @@ uv run dgml docset create --name "Lease Abstract" \
   --key-question "What is the monthly base rent?"
 ```
 
+For that curated case, pass `--auto-classify existing` so the run can
+only *route into* those DocSets, never invent more. Without it, one
+document that matches nothing anchors a brand-new one-file DocSet that
+someone has to notice and clean up:
+
+```bash
+payload=$(uv run dgml file add --workspace "$wid" /path/to/docs \
+            --recursive --on-conflict skip --auto-classify existing)
+jq -r '.results[] | "\(.classification.docset_name)\t\(.path)"' <<<"$payload"
+```
+
+⚠️ **Only use `existing` when you already know every file belongs in one
+of the workspace's DocSets.** The LLM is *required* to return a DocSet —
+it is offered no other action — so an off-type document is filed under
+the closest DocSet rather than flagged. For a mixed or unknown batch use
+bare `--auto-classify` (which can create DocSets) or `dgml cluster`
+(which groups the batch and names each group from the whole group).
+Silently mis-filed documents are harder to notice later than an extra
+DocSet is.
+
+⚠️ `--auto-classify` takes an *optional* MODE, so the parser eats the
+next token. Always put PATH **before** the flag (as above), or name the
+mode explicitly (`--auto-classify existing /path/doc.pdf`).
+`dgml file add --auto-classify /path/doc.pdf` exits 2 with
+`invalid choice: '/path/doc.pdf'`.
+
 Key contract points:
+- `--auto-classify` (bare) == `--auto-classify existing-or-new`: assign
+  if something fits, else create. `--auto-classify existing` never
+  creates and never declines — `decision` is always `"existing"`, so
+  every file lands in a DocSet whether or not it truly fits.
+- In `existing` mode against a workspace with **no** DocSets, the command
+  is a **hard** error (exit 1, `NO_EXISTING_DOCSETS`) and makes no LLM
+  call — there is nothing it could assign to. Seed the DocSets first.
+- In `existing` mode against a workspace with exactly **one** DocSet, the
+  file is assigned to it **without** an LLM call — one answer, no way to
+  decline, nothing to decide. The payload is unchanged
+  (`decision: "existing"`); only the call is skipped. That mode creates
+  no DocSets, so a whole bulk run over a one-DocSet workspace costs
+  nothing in tokens. Bare `--auto-classify` still calls the LLM here,
+  since it could create a second DocSet instead.
 - A missing or invalid `classification` config is a **hard** error
   (exit 1, `CLASSIFICATION_CONFIG_MISSING` / `_INVALID`): config is a
   precondition, so the command aborts rather than recording the same
@@ -193,7 +236,7 @@ summing to `total`) is the quick health read; report it to the user.
 
 Variants:
 - **Add to an existing DocSet:** skip the `docset create` step; pass its known ID as `$ds`. Find it with `uv run dgml docset list | jq -r '.docsets[] | select(.name=="…") | .id'`.
-- **Auto-route heterogeneous PDFs into DocSets**: drop the `docset create` step and the `docset add-file` loop; pass `--auto-classify` to `file add` instead. Each file lands in the best-fitting existing DocSet, or in a new one the LLM proposes — and DocSets created mid-run are visible to later files in the same batch, so similar PDFs cluster. Requires `classification` config in `<workspace>/config.toml`; see the one-shot example above. Read each file's `.results[].classification` block for the outcome.
+- **Auto-route heterogeneous PDFs into DocSets**: drop the `docset create` step and the `docset add-file` loop; pass `--auto-classify` to `file add` instead. Each file lands in the best-fitting existing DocSet, or in a new one the LLM proposes — and DocSets created mid-run are visible to later files in the same batch, so similar PDFs cluster. Requires `classification` config in `<workspace>/config.toml`; see the one-shot example above. Read each file's `.results[].classification` block for the outcome. Use `--auto-classify existing` instead when the workspace's DocSets are curated, the run must not create more, and you already know every file belongs in one of them — that mode forces the LLM to pick the closest DocSet for every file, so it mis-files an off-type document rather than flagging it.
 - **Recurse into subdirectories:** add `--recursive`.
 - **Hidden errors:** a PDF that fails to parse, render, or extract digital text still produces an entry — `soft_failed` (the `page_*`/`text_extraction_error` fields are set on its `file` entry) or `hard_failed` (the entry has an `error` object and no `file`). `dgml check` afterward is the authoritative whole-workspace health signal.
 
@@ -817,11 +860,13 @@ uv run dgml file delete <file_id>                      # delete File; clears all
 
 Check the response payload's `conflict_kind` (`"hash"` or `"path"`), `created`, and `note` fields to understand what actually happened.
 
+`file add --id <id>` fails with `CONFLICT` if another File holds that id with different content (under every policy, except `--on-conflict replace` re-ingesting a revised document under its own id). It fails with `INVALID_ARGUMENT` if the id is malformed, the path is a directory, or the policy would return an existing record carrying a different id — it never silently hands back an id you didn't ask for. `--id` is not allowed when the path is a directory.
+
 ## Things to remember
 
-- Ghostscript must be installed system-wide (`brew install ghostscript` / `apt-get install ghostscript`). Without it, page rendering fails and `dgml check` will flag it.
+- Ghostscript is the default PDF engine and must be installed system-wide (`brew install ghostscript` / `apt-get install ghostscript`) unless you switch engines. Without it, page rendering fails and `dgml check` will flag it. To avoid it entirely, set `[pdf] provider = "pypdfium2"` in the config (`pip install dgml[pdfium]`): PDFium then handles **both** page-image rendering and the page slicing `docset generate` needs, so no system binary is required.
 - A `docset delete` does **not** delete the underlying Files — they may belong to other DocSets. Use `file delete` to remove a File entirely.
-- IDs are 12-char base-36 strings. Don't try to derive them; always pull them from JSON output.
+- Generated IDs are 12-char base-36 strings. Don't try to derive them; always pull them from JSON output. A File ID can also be **set** at add time with `file add --id <id>` (3 to 40 characters using only lowercase letters, digits, hyphens and underscores, starting with a letter or digit) — do that when the id is decided elsewhere and must match, not to guess an existing one.
 - The JSON output schema is part of the public API. If a command's output shape looks wrong, the implementation is probably the source of truth — read [packages/dgml/src/dgml/cli.py](../../../packages/dgml/src/dgml/cli.py).
 
 ## Discover XML element subtrees and stake them on chain

@@ -33,6 +33,7 @@ from typing import IO, TYPE_CHECKING, Any
 from dgml_core import layout
 from dgml_core.classification import (
     ClassificationConfig,
+    ClassifyMode,
     classify_file,
     load_classification_config,
 )
@@ -44,13 +45,14 @@ from dgml_core.errors import (
     ConflictError,
     DgmlError,
     InvalidArgument,
+    NoExistingDocSets,
     StorageBackendMismatch,
-    StorageConfigInvalid,
     WorkspaceNotInitialized,
     now_iso,
     short_error_message,
 )
 from dgml_core.files import AddFileResult, ConflictPolicy, FileStore
+from dgml_core.ids import RECORD_ID_SHAPE
 from dgml_core.migrations import (
     MigrationResult,
     migrate_workspace,
@@ -58,7 +60,7 @@ from dgml_core.migrations import (
     stamp_schema_version,
 )
 from dgml_core.models import DocSet
-from dgml_core.pages import DEFAULT_DPI
+from dgml_core.pages import DEFAULT_DPI, load_pdf_config
 from dgml_core.storage import (
     ENV_VAR as WORKSPACE_ENV_VAR,
 )
@@ -79,7 +81,7 @@ from dgml_core.storage_resolve import (
     verify_storage_fingerprint,
 )
 from dgml_core.text_extraction import TextMode
-from dgml_core.workspace_id import is_workspace_id, mint_workspace_id
+from dgml_core.workspace_id import ID_SHAPE, generate_unique_workspace_id, is_workspace_id
 from dgml_core.workspaces_resolve import default_workspaces_store
 from dgml_core.workspaces_store import WorkspacesStore
 
@@ -187,7 +189,10 @@ def _add_global_flags(parser: argparse.ArgumentParser, *, suppress: bool) -> Non
     at parser-construction time, taking ``dgml --help`` down with it."""
     parser.add_argument(
         "--workspace",
-        type=Path,
+        # Deliberately *not* `type=Path`: `Path("./notes")` normalizes to `notes`, and
+        # that leading `./` is load-bearing. It is how a caller says "the directory, not
+        # the workspace of that name" — the escape when a listed id shadows a local
+        # directory — and `Workspace.resolve` can only honour it if it survives argparse.
         default=argparse.SUPPRESS if suppress else None,
         help=_WORKSPACE_HELP,
     )
@@ -333,6 +338,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Human-readable workspace name (identity metadata, stored in workspace.json). "
             "Defaults to the workspace directory name."
+        ),
+    )
+    ws_create.add_argument(
+        "--id",
+        default=None,
+        metavar="WORKSPACE_ID",
+        help=(
+            f"Set the workspace's stable handle instead of generating one — {ID_SHAPE}, "
+            "e.g. 'my-workspace'. It is what --workspace and $DGML_HOME address the "
+            "workspace by, and the folder name the local store of workspaces gives it. "
+            "Fails with CONFLICT if this machine's store of workspaces already holds "
+            "that id. Omit it for a generated ws_… id."
         ),
     )
     ws_create.add_argument(
@@ -600,6 +617,18 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     fl_add.add_argument(
+        "--id",
+        default=None,
+        metavar="FILE_ID",
+        help=(
+            f"Assign this id to the new File instead of generating one — {RECORD_ID_SHAPE}, "
+            "e.g. 'invoice-2024-q1'. Fails with CONFLICT if another File already holds "
+            "it with different content — no --on-conflict policy overrides that. "
+            "Re-adding identical content under the same id is a no-op. Not allowed when "
+            "PATH is a directory. Omit it for a generated 12-character id."
+        ),
+    )
+    fl_add.add_argument(
         "--on-conflict",
         choices=[p.value for p in ConflictPolicy],
         default=ConflictPolicy.ERROR.value,
@@ -638,15 +667,28 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     fl_add.add_argument(
         "--auto-classify",
-        action="store_true",
+        nargs="?",
+        metavar="MODE",
+        const=ClassifyMode.EXISTING_OR_NEW.value,
+        default=None,
+        choices=[m.value for m in ClassifyMode],
         help=(
             "After adding, use the configured vision LLM to assign the file "
-            "to a DocSet — assigning to an existing DocSet if one fits, "
-            "otherwise creating a new one. Requires a 'classification' section "
-            "in <workspace>/config.toml; a missing or invalid config is a hard "
-            "error (exit 1). Failures of the classification call itself (LLM "
-            "error, auth) are reported in the 'classification' field of the "
-            "response payload without aborting the file add."
+            "to a DocSet. MODE is 'existing-or-new' (the default when the flag "
+            "is passed bare): assign to an existing DocSet if one fits, "
+            "otherwise create a new one. 'existing' never creates a DocSet — "
+            "the LLM must pick the best-fitting existing one, and is required "
+            "to choose even when the fit is poor. Use 'existing' ONLY when you "
+            "already know the file belongs in one of the workspace's DocSets: "
+            "an off-type document is assigned to the closest DocSet anyway, "
+            "not flagged. With no DocSets to choose from it is an error "
+            "(NO_EXISTING_DOCSETS, exit 1). Note MODE is consumed greedily, so "
+            "put PATH before this flag (or pass MODE explicitly). Requires a "
+            "'classification' section in <workspace>/config.toml; a missing or "
+            "invalid config is a hard error (exit 1). Failures of the "
+            "classification call itself (LLM error, auth) are reported in the "
+            "'classification' field of the response payload without aborting "
+            "the file add."
         ),
     )
     files.add_parser("list", parents=[common], help="List Files.")
@@ -1195,16 +1237,14 @@ def main(argv: list[str] | None = None) -> int:
             # silently opening an empty backend. `workspace reseal` (exempt above,
             # under the `workspace` group) is how an intended change is accepted.
             verify_storage_fingerprint(ws)
+            # One check, not two: `is_initialized()` *is* "has a config". The config
+            # names the backend and cannot be reconstructed from anything else, so an
+            # absent one is indistinguishable from "never a workspace" — and both want
+            # the same answer from the caller. The message covers both readings.
             if not ws.is_initialized():
                 raise WorkspaceNotInitialized(
                     _uninitialized_message(ws, from_default=_root_is_the_cwd_default(args))
                 )
-            if not ws.config_present:
-                # The config names the backend and cannot be reconstructed from
-                # anything else — an absent one is indistinguishable from "this was a
-                # remote workspace whose config was deleted", which would otherwise
-                # fall through to the local default and report an empty workspace.
-                raise StorageConfigInvalid(_missing_config_message(ws))
             _warn_if_config_declares_workspaces(ws)
             # Upgrade an older workspace in place before anything reads it. This
             # is the one point every command passes through, so there is no
@@ -1353,27 +1393,22 @@ def _root_is_the_cwd_default(args: argparse.Namespace, *, path: Path | None = No
 
 
 def _uninitialized_message(ws: Workspace, *, from_default: bool) -> str:
-    """Why this workspace cannot be used, and two remedies that actually work.
+    """Why this workspace cannot be used, and remedies that actually work.
 
-    The old wording was "run 'dgml workspace create'", which became a loop: a bare
-    `create` now puts the workspace in the store of workspaces, so following the advice
-    literally creates one *somewhere else* and leaves the next command failing
-    identically. Both suggestions here resolve to the workspace the caller was asking
-    about — the same property :func:`_missing_config_message` has."""
-    looked = (
-        " (dgml looked there because neither --workspace nor $DGML_HOME was set)"
-        if from_default
-        else ""
-    )
-    return (
-        f"workspace at {ws.root} is not initialized{looked}. Create one there with "
-        f"'dgml workspace create {ws.root} --organization <org>', or, if you already have "
-        f"a workspace, find it with 'dgml workspace list' and pass --workspace <ws_id>."
-    )
+    ``is_initialized()`` is "has a config", so this one message answers two readings
+    of the same fact: *never a workspace*, and *a workspace whose config is gone*.
+    Nothing on disk distinguishes them for a remote-backed workspace, and for a local
+    one the distinction would not change the advice — so both remedies are offered
+    rather than guessed between.
 
+    Addressed by id, the root is meaningless (the workspace lives in a store, not at a
+    path), so that case names the store and the id instead.
 
-def _missing_config_message(ws: Workspace) -> str:
-    """Why this workspace cannot be opened, and what would fix it."""
+    "Run 'dgml workspace create'" alone would be a loop: a bare `create` puts the
+    workspace in the store of workspaces, so following it literally creates one
+    *somewhere else* and leaves the next command failing identically. Every suggestion
+    below resolves to the workspace the caller was actually asking about.
+    """
     if ws.workspaces_id is not None:
         return (
             f"{ws.config_location} holds no config for {ws.workspaces_id}. It names this "
@@ -1381,11 +1416,17 @@ def _missing_config_message(ws: Workspace) -> str:
             f"backup, or run 'dgml workspace list' to see what this machine's store of "
             f"workspaces does hold."
         )
+    looked = (
+        " (dgml looked there because neither --workspace nor $DGML_HOME was set)"
+        if from_default
+        else ""
+    )
     return (
-        f"{ws.config_path} is missing. It names this workspace's storage backend and "
-        f"cannot be reconstructed — restore it from backup, or, if this workspace is on "
-        f"default local storage, re-run 'dgml workspace create {ws.root} "
-        f"--organization <org>'."
+        f"no workspace at {ws.root}: {ws.config_path} is missing{looked}. The config "
+        f"names the storage backend and cannot be reconstructed — create a workspace "
+        f"there with 'dgml workspace create {ws.root} --organization <org>', restore the "
+        f"config from backup, or, if you already have a workspace, find it with "
+        f"'dgml workspace list' and pass --workspace <ws_id>."
     )
 
 
@@ -1579,7 +1620,7 @@ def _import_one(
         # No identity anywhere: no `[workspace] workspace_id`, no `workspace.json`, and no
         # legacy index row. That is not a workspace dgml ever created — a directory with
         # `docsets/` and `files/` in it is not enough — so there is nothing to import it
-        # *as*, and minting an id here would adopt an arbitrary directory as a workspace.
+        # *as*, and generating an id here would adopt an arbitrary directory as a workspace.
         return {
             **row,
             "status": "failed",
@@ -1603,8 +1644,8 @@ def _import_one(
             **row,
             "status": "failed",
             "reason": (
-                f"workspace_id {workspace_id!r} is not well-formed — it must be 'ws_' "
-                f"followed by exactly 16 characters from [a-z2-7], or nothing can address "
+                f"workspace_id {workspace_id!r} is not well-formed — it must be "
+                f"{ID_SHAPE}, or nothing can address "
                 f"or list this workspace. Correct it in {source.config_location} (the "
                 f"[workspace] block) and in {root / layout.WORKSPACE_FILE}, then re-run. "
                 f"The legacy index is left in place, so nothing is lost meanwhile."
@@ -1728,6 +1769,89 @@ def _workspace_import(args: argparse.Namespace, fmt: str) -> int:
     return 0 if not payload["failed"] else 2
 
 
+def _requested_workspace_id(args: argparse.Namespace, ws: Workspace, *, listed: bool) -> str | None:
+    """``workspace create --id``, validated against the workspace being created.
+
+    Returns the id to use, or ``None`` when the caller passed none and one should be
+    generated. Everything here runs before the workspace's config, directory or store row
+    exists, so a rejected ``--id`` leaves nothing behind.
+
+    Three ways it can fail, and they are different errors on purpose: a malformed id is
+    the caller's typo (``INVALID_ARGUMENT``); an id that disagrees with one this
+    workspace already records is a re-run that would *re-identify* an existing
+    workspace, which ``create`` never does, and is also the caller's mistake; an id
+    another workspace already holds is a genuine collision (``CONFLICT``), because
+    proceeding would overwrite that workspace's config in the store.
+
+    ``listed`` says a **new** store-listed workspace is being created, in which case
+    ``ws`` is not it — it is whatever ``Workspace.resolve`` fell back to, and the caller
+    discards it. See the comment on ``known`` below.
+    """
+    from dgml_core import workspace_config as wsconfig
+
+    requested: str | None = args.id
+    if requested is None:
+        return None
+    if not is_workspace_id(requested):
+        raise InvalidArgument(
+            f"--id {requested!r} is not a well-formed workspace id: it must be {ID_SHAPE}."
+        )
+
+    # What this workspace is *already* called, if anything: the id it is listed under,
+    # else the one its own config records. `create` is documented as safe to re-run, so
+    # an --id that agrees with it is a no-op rather than a conflict — including for a
+    # detached workspace that has since been imported into the store, where the naive
+    # `store.exists` check below would otherwise report the workspace colliding with
+    # itself.
+    #
+    # Except when a new listed workspace is being created: then `ws` is only what
+    # `Workspace.resolve` fell back to — `./dgml-workspace` in the working directory —
+    # and the caller replaces it wholesale with one rooted at the new id. Reading an
+    # identity off it would make `create --id` fail wherever a `./dgml-workspace`
+    # happens to sit, complaining that "this workspace" has a different id, while the
+    # same command without `--id` cheerfully generates one and ignores that directory.
+    if listed and ws.workspaces_id is None:
+        known = None
+    else:
+        known = ws.workspaces_id or wsconfig.read_identity(ws).workspace_id
+    if known is not None:
+        if known != requested:
+            # Name *how* this workspace came to be addressed. Someone passing --id has
+            # almost always come to create a new workspace and not realized something is
+            # pointing at an existing one — easy when $DGML_HOME is set once and then
+            # forgotten — so the message names that thing rather than describing "this
+            # workspace" and leaving them to guess what to change.
+            if args.path is not None:
+                addressed = f"the path {str(args.path)!r} you gave"
+                stop = "drop that path argument"
+            elif getattr(args, "workspace", None) is not None:
+                addressed = f"--workspace {str(args.workspace)!r}"
+                stop = "drop --workspace"
+            elif os.environ.get(WORKSPACE_ENV_VAR, "").strip():
+                addressed = f"${WORKSPACE_ENV_VAR}"
+                stop = f"unset {WORKSPACE_ENV_VAR}"
+            else:  # pragma: no cover - defensive; one of the three is always set here
+                addressed = "the workspace this command resolved"
+                stop = "stop addressing it"
+            raise InvalidArgument(
+                f"--id {requested!r} does not match {known!r}, the id of the workspace "
+                f"addressed by {addressed}.\n\n"
+                f"To create a *new* workspace called {requested!r}, {stop} — it is what "
+                f"points this command at the existing one."
+            )
+        return requested
+
+    store = default_workspaces_store()
+    if store.exists(requested):
+        raise ConflictError(
+            f"{store.label()} already holds a workspace {requested}. Pick another --id, "
+            f"or open the existing one with --workspace {requested}.",
+            kind="workspace",
+            existing_id=requested,
+        )
+    return requested
+
+
 def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     """Workspace lifecycle: create, list, reseal.
 
@@ -1755,13 +1879,18 @@ def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
             # `dgml workspace create ./ws …` reads without doubling --workspace.
             ws = Workspace(root=Path(args.path).expanduser().resolve())
 
+        # --id, settled before anything is written. A rejected id must not leave a
+        # half-built workspace behind, and for a listed workspace the id decides the
+        # root, so there is no later point at which this could be checked.
+        requested_id = _requested_workspace_id(args, ws, listed=listed)
+
         seed = _read_seed_config(args)
 
         if listed and ws.workspaces_id is None:
             # The id has to come first, because for a store-listed workspace the root is
             # derived from it — the reverse of the detached order.
             store = default_workspaces_store()
-            new_id = mint_workspace_id(store)
+            new_id = requested_id or generate_unique_workspace_id(store)
             store.write_config(new_id, seed or "")
             ws = Workspace(root=store.workspace_root(new_id), workspaces_id=new_id)
         elif seed is not None and not ws.config_present:
@@ -1863,13 +1992,18 @@ def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         # command once the pointer became readable.
         ws.root.mkdir(parents=True, exist_ok=True)
         _write_workspace_config(ws, service, seed is not None)
-        # Reuse the id the config already carries; mint only for a genuinely new
+        # Reuse the id the config already carries; generate only for a genuinely new
         # workspace. Minting unconditionally broke the documented "idempotent and safe
         # to re-run" promise in two ways: re-running on the same machine forked the id
         # and left two rows for one workspace, and running it on a second machine
         # against a shared config changed the org's workspace identity — including the
         # `workspace` record in the remote doc store.
-        workspace_id = ws.workspaces_id or recorded.workspace_id or mint_workspace_id()
+        workspace_id = (
+            ws.workspaces_id
+            or recorded.workspace_id
+            or requested_id
+            or generate_unique_workspace_id()
+        )
         wsconfig.write_identity(
             ws,
             workspace_id=workspace_id,
@@ -1885,8 +2019,9 @@ def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         ws = Workspace(root=ws.root, workspaces_id=ws.workspaces_id)
         wsconfig.write_identity(ws, storage_fingerprint=storage_fingerprint_pair(*ws.store_configs))
 
-        # Now build the workspace through the selected backend.
-        ws.init()
+        # Now build the workspace through the selected backend. Nothing is
+        # scaffolded first: stores create their own containers on write, so the
+        # workspace exists by virtue of its config and this first document.
         ws.write_meta(name=name, organization=organization, workspace_id=workspace_id)
         # Stamp the current layout revision so a brand-new workspace is never
         # mistaken for an old one and re-scanned by the migration on first use.
@@ -3501,6 +3636,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     workspace=ws,
                     dgml_header=build_header(ws.organization, ds.name),
                     converters=load_conversion_config(ws),
+                    pdf_config=load_pdf_config(ws),
                     roster_seed=roster_seed,
                     schema_seed=schema_seed,
                     parent_map=parent_map_seed or None,
@@ -3684,6 +3820,20 @@ def _gather_pdfs(directory: Path, *, recursive: bool, suffixes: frozenset[str]) 
     return sorted(p for p in candidates if p.is_file() and p.suffix.lower() in suffixes)
 
 
+def _require_existing_docsets(docsets: list[DocSet]) -> None:
+    """Guard the ``--auto-classify existing`` precondition.
+
+    That mode must place the file in an existing DocSet, so an empty workspace
+    admits no outcome at all. Raising beats degrading to "unassigned", which is
+    the very thing the mode is chosen to avoid.
+    """
+    if not docsets:
+        raise NoExistingDocSets(
+            "no DocSets to assign to; create one with `dgml docset create`, "
+            f"or use `--auto-classify {ClassifyMode.EXISTING_OR_NEW}`"
+        )
+
+
 def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fmt: str) -> int:
     """Add every PDF under a directory in one run, emitting a single envelope.
 
@@ -3701,7 +3851,9 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
     recursive: bool = args.recursive
     pdfs = _gather_pdfs(directory, recursive=recursive, suffixes=_ingestible_suffixes(ws))
 
-    auto_classify = getattr(args, "auto_classify", False)
+    classify_mode = getattr(args, "auto_classify", None)
+    auto_classify = classify_mode is not None
+    allow_new = classify_mode != ClassifyMode.EXISTING
     config: ClassificationConfig | None = None
     docsets: list[DocSet] | None = None
     if auto_classify:
@@ -3712,6 +3864,10 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
         # Read existing DocSets once; _auto_classify appends newly-created
         # ones so similar PDFs cluster within the run without re-scanning.
         docsets = DocSetStore(ws).list_all()
+        if not allow_new:
+            # Checked here so the run aborts before any file is added rather
+            # than on the first one.
+            _require_existing_docsets(docsets)
 
     on_conflict = ConflictPolicy(args.on_conflict)
     text_mode = TextMode(args.text_mode)
@@ -3754,7 +3910,12 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
         entry: dict[str, Any] = {"status": status, "path": str(pdf), **_file_add_payload(result)}
         if auto_classify:
             entry["classification"] = _auto_classify(
-                ws, result, config=config, docsets=docsets, debug=args.debug
+                ws,
+                result,
+                config=config,
+                docsets=docsets,
+                allow_new=allow_new,
+                debug=args.debug,
             )
         entries.append(entry)
 
@@ -3773,9 +3934,31 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     sub = args.file_command
     if sub == "add":
         if args.path.is_dir():
+            # Checked here rather than in FileStore.add: "directory" is a
+            # CLI-surface concept the store never sees (its is_file() check
+            # would fail first, with a misleading "does not exist").
+            if args.id is not None:
+                raise InvalidArgument(
+                    f"--id names one File and cannot be used when PATH is a directory "
+                    f"({args.path}) — a bulk run adds many. Add the files one at a time "
+                    f"to choose each id."
+                )
             return _file_add_bulk(args, ws, store, fmt)
+        classify_mode = getattr(args, "auto_classify", None)
+        allow_new = classify_mode != ClassifyMode.EXISTING
+        config: ClassificationConfig | None = None
+        docsets: list[DocSet] | None = None
+        if classify_mode is not None and not allow_new:
+            # Assign-only mode has to land the file in an existing DocSet, so
+            # both its preconditions are checked *before* ingesting: erroring
+            # out after the add would leave behind exactly the unassigned file
+            # this mode exists to prevent. Same order as the bulk path.
+            config = load_classification_config(ws)
+            docsets = DocSetStore(ws).list_all()
+            _require_existing_docsets(docsets)
         result = store.add(
             args.path,
+            file_id=args.id,
             on_conflict=ConflictPolicy(args.on_conflict),
             text_mode=TextMode(args.text_mode),
             dpi=args.dpi,
@@ -3783,10 +3966,18 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
             debug=args.debug,
         )
         payload: dict[str, Any] = _file_add_payload(result)
-        if getattr(args, "auto_classify", False):
-            # _auto_classify loads the classification config itself; a
-            # missing/invalid one raises straight through to an error envelope.
-            payload["classification"] = _auto_classify(ws, result, debug=args.debug)
+        if classify_mode is not None:
+            # In the default mode _auto_classify loads the classification
+            # config itself; a missing/invalid one raises straight through to
+            # an error envelope.
+            payload["classification"] = _auto_classify(
+                ws,
+                result,
+                config=config,
+                docsets=docsets,
+                allow_new=allow_new,
+                debug=args.debug,
+            )
         _emit(payload, fmt)
     elif sub == "list":
         _emit({"files": [f.to_json() for f in store.list_all()]}, fmt)
@@ -3806,11 +3997,21 @@ def _auto_classify(
     *,
     config: ClassificationConfig | None = None,
     docsets: list[DocSet] | None = None,
+    allow_new: bool = True,
     debug: bool = False,
 ) -> dict[str, Any]:
     """Run LLM auto-classification on a freshly added File and assign it.
 
     Returns the ``classification`` block embedded in ``dgml file add`` output.
+
+    ``allow_new=False`` (``--auto-classify existing``) forbids creating a
+    DocSet and always assigns: the LLM is given only the assign tool and must
+    return the best-fitting DocSet even when the fit is poor. With no DocSets
+    to choose from the mode has no possible outcome, so it is a **hard** error
+    (``NO_EXISTING_DOCSETS``) — a precondition on the request rather than a
+    failure of the classification call. Callers check it via
+    :func:`_require_existing_docsets` before adding any file; the re-raise
+    below keeps it hard if one ever doesn't.
 
     A missing or invalid classification config is a **hard** failure: when
     ``config`` is not supplied it is loaded here via
@@ -3852,7 +4053,14 @@ def _auto_classify(
     }
 
     try:
-        decision = classify_file(ws, file_id, config=config, docsets=docsets, debug=debug)
+        decision = classify_file(
+            ws, file_id, config=config, docsets=docsets, allow_new=allow_new, debug=debug
+        )
+    except NoExistingDocSets:
+        # A precondition on the request, not a failure of the call — callers
+        # check it before ingesting anything. Kept hard even if one didn't:
+        # soft-failing would leave the unassigned file this mode prevents.
+        raise
     except DgmlError as exc:
         block["error"] = f"{exc.code}: {exc}"
         return block
@@ -3878,7 +4086,7 @@ def _auto_classify(
             )
             if extraction_block is not None:
                 block["extraction"] = extraction_block
-        else:
+        elif decision.decision == "new":
             assert decision.new_name is not None and decision.new_description is not None
             created = docset_store.create(
                 name=decision.new_name,
@@ -3895,6 +4103,8 @@ def _auto_classify(
                 docset_name=created.name,
                 docset_key_questions=list(created.key_questions),
             )
+        else:  # unreachable — classify_file returns only these three
+            raise AssertionError(f"unhandled classification decision: {decision.decision}")
     except DgmlError as exc:
         block["error"] = f"{exc.code}: {exc}"
     return block
