@@ -93,7 +93,10 @@ class MacosProvider(OcrProvider):
         # (they intermittently raise `KeyError: 'CGImageSource…'`). Vision
         # decodes the bytes (PNG/JPEG) itself.
         data = self._foundation.NSData.dataWithBytes_length_(image_bytes, len(image_bytes))
-        handler = vision.VNImageRequestHandler.alloc().initWithData_options_(data, {})
+        # `options` is None, not `{}`: bridging an EMPTY Python dict to the
+        # NSDictionary parameter raises `NSInvalidArgumentException - key does
+        # not exist` on macOS 27 / current pyobjc, failing every page.
+        handler = vision.VNImageRequestHandler.alloc().initWithData_options_(data, None)
         if handler is None:
             raise OcrFailed(f"page {page_num}: could not read image bytes for Vision OCR")
         ok, error = handler.performRequests_error_([request], None)

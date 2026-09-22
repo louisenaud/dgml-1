@@ -223,6 +223,41 @@
 
   Output JSON only:
   {"concepts": {"<concept>": "<one-line role description>", ...}}
+# Gap planning for --extend-schema: propose the roles the supplied schema
+# misses, from every document's skeleton at once. Without it the additions
+# get invented per document and differ run to run.
+"plan_gaps_system": |
+  You extend an EXISTING concept vocabulary for a set of related documents.
+
+  You are shown two things: the vocabulary its owner already wrote, and the
+  structural skeleton (headings, form fields, table rows, first list items) of
+  every document. Your job is to propose concepts for the RECURRING ROLES THE
+  EXISTING VOCABULARY DOES NOT COVER — and nothing else.
+
+  Rules, in order of importance:
+  - Propose NOTHING that an existing concept already covers. Check the list
+    first, every time. If a role is covered, it is not a gap.
+  - Never propose a VARIANT of an existing name. If `ItemPrice` exists, do
+    not propose `ItemPricing`, `ItemPrices`, or `PriceByItem`.
+    Differences of wording, number, or word order are not new concepts.
+  - Propose only roles that RECUR across the documents. A one-off is not worth
+    a shared concept; the per-document labeling can handle it.
+  - Container roles are the most commonly missed: authors write the fields and
+    forget the box around them (an order's line-item collection, a signature
+    block, a fee schedule). Look for repeating groups that have no container.
+  - Name them the way the existing vocabulary is named — same style, same level
+    of specificity — so the combined list reads as ONE vocabulary.
+
+  Concepts are PascalCase role names. Name the ROLE, never the value. Never
+  include structural or discourse words ("Section", "Clause", "Item",
+  "Heading", "Paragraph", "List", "Title"). Never propose generic catch-alls
+  ("Information", "Details", "Data", "Other").
+
+  A SHORT, well-judged list is the goal. Proposing few or none is a perfectly
+  good answer when the existing vocabulary already covers the documents.
+
+  Output JSON only, and include ONLY your additions:
+  {"concepts": {"<concept>": "<one-line role description>", ...}}
 "roster_complete": |-
   Review your roster against the document skeletons above. A first-pass roster
   routinely MISSES recurring roles. ADD every recurring section, field, column,
@@ -234,10 +269,74 @@
   {"concepts": {"<concept>": "<one-line role description>", ...}}
 "roster_intro": |-
   CONCEPTS ALREADY IN USE in this document set — reuse these names verbatim where the role matches:
+# Closing the vocabulary must not also switch off density. An earlier version
+# framed leaving a block unlabeled as free and reaching outside the list as
+# the cardinal sin; the model responded by labeling almost nothing. Forbid
+# inventing names, but keep dense labeling the job.
+"roster_closed_intro": |-
+  THE COMPLETE CONCEPT VOCABULARY for this document set. These names are the
+  entire palette you have to work with: use them VERBATIM, exactly as spelled
+  below. Do not coin, invent, rename, abbreviate, or pluralize any other name.
+
+  Your job is unchanged: label DENSELY, following every density rule above.
+  This list is not a filter to be applied sparingly — it is the vocabulary this
+  whole document set is written in, and MOST blocks have a concept on it that
+  fits. For every block, entity, and table cell, first find the listed concept
+  whose ROLE best matches what you are labeling, and use that name. A listed
+  concept whose role matches is always the right answer, even when the wording
+  printed on the page is different from the concept's name — you are matching
+  roles, not spellings.
+
+  EVERY heading still gets a concept naming its section's role, and repeating
+  rows, columns, and fields still get theirs, exactly as described above.
+
+  Only when NO listed concept names a block's role at all should you return it
+  with no concept (omit the "concept" key, or give it ""). That is the
+  exception, not the default: an unlabeled block loses its meaning, so look for
+  the listed concept that genuinely fits before leaving anything untagged. What
+  you must not do is answer with a name that is not on the list — such a name
+  is discarded, so it helps nothing.
+
+  THE VOCABULARY:
+# Used instead of roster_intro when the schema may be added to. The softer
+# wording let coined names crowd out the supplied ones, so three things must
+# survive any rewrite: reuse is the default action, coining is the exception,
+# and coining a variant of a listed name is forbidden.
+"roster_extend_intro": |-
+  THE VOCABULARY FOR THIS DOCUMENT SET, supplied by the person who owns these
+  documents. It is AUTHORITATIVE: these are the names they want to see, and
+  reusing them is your default action, not a fallback.
+
+  For EVERY block, entity, and table cell: first look for a listed concept
+  whose ROLE matches what you are labeling, and if one does, use that name
+  VERBATIM, exactly as spelled. Match on role, not on wording — a listed
+  concept is still the right answer when the text printed on the page uses
+  different words from the concept's name.
+
+  You MAY coin a new name, but only for a genuine gap: a recurring role that
+  no listed concept covers at all. Before you coin, check the list once more.
+
+  Never coin a VARIANT of a listed name. If the list has `ItemPrice`, do
+  not answer `ItemPricing`, `ItemPrices`, or `PriceByItem` — reuse
+  the listed spelling. Near-duplicates of the supplied vocabulary are the one
+  thing this mode must not produce; they fragment the very consistency the
+  supplied schema exists to provide.
+
+  Label densely, following every density rule above. Anything you do coin will
+  be reported back to the owner as a candidate to add to their schema, so coin
+  deliberately and name it as carefully as they named theirs.
+
+  THE VOCABULARY:
 "roster_planned_intro": |-
   PLANNED CONCEPTS for this document set — proposed from the documents' shared structure, not yet observed; reuse one when its role matches rather than coining a new name:
 "section_retry": |-
   These section headings were left unlabeled. Give each a concept naming its section's role:
+"section_retry_closed": |-
+  These section headings were left unlabeled. Give each one the concept from
+  the vocabulary above that names its section's role, reusing a listed name
+  verbatim — most of these headings have one that fits, so work through them
+  one by one and find it. Leave a heading out of your reply only when no listed
+  concept names its role at all. Do not coin a name to fill a gap:
 "describe_concepts": |
   You write one-line ROLE descriptions for document field concepts. Each concept
   is a PascalCase name shown with one or more example values observed in the
@@ -282,3 +381,153 @@
 
   Return JSON only: {"verdicts": [{"i": 0, "keep": true, "reason": "..."}]}
   Include one verdict per candidate index.
+
+# --------------------------------------------------------------------------
+# Prompt variants: partial overrides selected with $DGML_PROMPT_VARIANT.
+# A variant lists only the prompts it replaces; everything else stays baseline.
+# Used by the compass benchmark to A/B prompt wording as a measured axis.
+# --------------------------------------------------------------------------
+variants:
+  # The fewshot worked example below is SYNTHETIC — hand-written for this
+  # prompt, not drawn from any docset. Its domain (a construction subcontract)
+  # is deliberately absent from the compass benchmark docsets so the variant
+  # is never tuned to a document it is measured on.
+  fewshot:
+    label_system: |
+      You assign SEMANTIC CONCEPTS to transcribed document blocks. The documents
+      belong to one document set; your single most important job is to use the
+      SAME concept for the same role across every block and every document.
+
+      REUSE BEFORE YOU COIN. A roster of concepts already in use is provided. For
+      EVERY block and entity, FIRST scan the roster for a concept whose role
+      matches what you are labeling — if one fits, use that name VERBATIM. Coin a
+      NEW concept ONLY when no roster entry fits the role. The roster should supply
+      most of your labels; coining a fresh concept for a role the roster already
+      covers is the most common and most damaging mistake you can make.
+
+      Concepts are PascalCase role names ("PaymentTerms", "CommencementDate",
+      "EquipmentName"). Name the ROLE, never the value: a concept must stay
+      correct if a different document filled it with different content.
+
+      Concept naming rules:
+      - NEVER include structural or discourse words ("Section", "Clause", "Item",
+        "Heading", "Paragraph", "List", "Title", "Text", "Block"): the block's
+        structure is recorded separately. "PaymentTerms", not "PaymentTermsClause".
+      - Be as SPECIFIC as the content supports: name what the content is about,
+        not its broad family. Prefer the precise role over an umbrella term.
+      - One concept names ONE role. If a heading covers several distinct topics,
+        pick the dominant role — never concatenate topics into one name.
+
+      Density rules:
+      - EVERY heading block gets a concept naming its section's role
+        ("RepairsAndMaintenance", "InsuranceObligations", "Definitions").
+        Never skip a heading.
+      - If a heading's TEXT is itself a value rather than a topic title, add an
+        entity quoting the whole heading text, with a concept naming that value-kind.
+      - Paragraphs get a concept when they carry an identifiable role
+        (a definition, an obligation, a notice clause); ordinary connective
+        prose stays unlabeled — that is the only category you may skip.
+      - Do NOT give a section heading, a heading nested inside it, and that
+        section's body all the SAME concept. Each names its own role — broader at
+        the top, narrower below; a body that only restates the section's topic
+        stays unlabeled rather than repeating the section's concept.
+      - Never use generic catch-alls ("section", "content", "paragraph", "misc").
+
+      Tables (row blocks) — for each row, also return:
+        "table": a name for the whole table (the kind of thing it holds, NO
+          "Table" in the name), the SAME for every row of that table; and
+        "cells": one concept per cell, in column order, each naming the kind of
+          value that column holds (what its header would be called).
+        When rows are records of the same kind (e.g. a column always holds a
+        name, the next always a price), every row gets the SAME "table",
+        the SAME row "concept", and the SAME per-column "cells" concepts —
+        consistency across rows is required. When the table instead pairs a
+        field with its value and each row is DIFFERENT information, the cell
+        concepts are specific to that row's value (they will differ between
+        rows) — name them by what each value is.
+        A single cell may pack MORE THAN ONE value into one column (for example an
+        identifier next to the name it labels). For such a cell, add an "entities"
+        list with one entry per value (each a verbatim quote + its own concept) —
+        the values are tagged inline inside the cell. Use "cells" for single-value
+        columns and "entities" for cells that carry several distinct values; a cell
+        may use either.
+
+      Lists (item blocks):
+        - Short, uniform items (a list of like things) all share ONE concept.
+        - Items that are full clauses/paragraphs each get their own specific
+          concept.
+
+      For blocks whose text contains atomic extractable values (dates, amounts,
+      durations, parties, identifiers), also add entities. Each entity is the
+      value QUOTED VERBATIM from the block's text: copy the complete value exactly
+      as printed — never a fragment of it, never surrounding words or punctuation
+      that are not part of the value, and never one value split across several
+      entities. If the same value string occurs more than once in the block, add
+      "occurrence": N (1-based) for the one you mean; otherwise omit it.
+
+      Entity concepts name the KIND OF VALUE — what a column header for that field
+      would be called — never the topic it belongs to:
+      - A block about a supplier contains values of different kinds: the supplier's
+        name is "SupplierName", its address "SupplierAddress", its registration
+        number "SupplierRegistrationNumber" — never all of them "Supplier".
+      - An entity concept must NEVER equal its block's concept — EXCEPT when the
+        entity's quote is the block's ENTIRE text (the block is itself only that one
+        value): then tag the block with that single concept and add no separate
+        entity. Otherwise the block concept names what the content is ABOUT and each
+        entity concept names the KIND of value it is. When a value would otherwise
+        take the block's own name, make the value's concept MORE SPECIFIC — name the
+        kind of value (an amount, a date, a rate, an identifier, …) — so the block
+        keeps its role and the value stays distinctly tagged.
+      - If a block is only a short label followed by its value (a "label: value"
+        line), the value carries the concept and the block stays unlabeled — tag the
+        value, not the whole line.
+      - An entity "quote" is always the VALUE text itself, never its caption or
+        label: in "Effective Date: March 1, 2022" the quote is "March 1, 2022" —
+        never "Effective Date". A caption with no value on the block gets no entity.
+      - Distinct value kinds in one block always get distinct concepts (a date is
+        never the same concept as an amount, a name never the same as an address).
+
+      Output JSON only:
+      {"labels": {"<block_id>": {"concept": "...",
+        "entities": [{"quote": "<exact substring>", "concept": "...",
+          "occurrence": <1-based; include ONLY when the same value string repeats
+          in the block, to pick which instance — omit otherwise>}]}}}
+      Every key must be a block id from the input. Label densely per the rules
+      above; omit only connective prose.
+
+      GRANULARITY — worked example (this calibrates HOW MANY concepts to emit).
+
+      Given these transcribed blocks from a construction subcontract:
+
+        h1   "4.1 Site Access Requirements"
+        p    "Deliveries are accepted between 7:00 am and 3:30 pm on working days."
+        item "Vehicle gross weight not exceeding 7.5 tonnes on the north ramp."
+        item "Noise levels below 75 dB(A) during evening works."
+        row  ["Scaffold inspection", "every 7 days"]
+
+      CORRECT — one concept per distinct role, values tagged inline:
+
+        h1   -> SiteAccessRequirements
+        p    -> DeliveryHours            entity "7:00 am and 3:30 pm" -> DeliveryWindow
+        item -> VehicleWeightRestriction entity "7.5 tonnes"          -> VehicleWeightLimit
+        item -> NoiseLimitEveningWorks   entity "75 dB(A)"            -> NoiseLimit
+        row  -> SafetyInspectionInterval table SafetyInspectionSchedule
+                cells [InspectionType, InspectionInterval]
+
+      WRONG — too coarse. Collapsing distinct roles under one umbrella concept
+      loses every field a consumer would query:
+
+        h1 -> SiteAccessRequirements ; p -> SiteAccessRequirements ;
+        item -> SiteAccessRequirements ; item -> SiteAccessRequirements
+
+      WRONG — too fine. Naming the value instead of the role, or splitting one
+      value across concepts:
+
+        p -> DeliveriesSevenAmToThreeThirtyPm ;
+        item -> VehicleWeight_7_5 ; item -> Noise_75_dBA
+
+      Calibrate to the CORRECT column. Name each distinct role once, at the
+      specificity a downstream consumer would query it by ("NoiseLimitEveningWorks",
+      neither "SiteAccessRequirements" nor "NoiseLevelsBelowSeventyFiveDecibels").
+      If two adjacent blocks state DIFFERENT facts they get DIFFERENT concepts;
+      consolidating them is the more damaging error of the two.

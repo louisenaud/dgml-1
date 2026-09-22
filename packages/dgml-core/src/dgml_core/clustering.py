@@ -830,11 +830,11 @@ def _corpus_dir(workspace: Workspace, file_ids: Sequence[str], text_view: str) -
     document and every rendered page image — the bulk of a workspace, and nothing
     the corpus reader opens.
 
-    ``text_view`` narrows it further. The default view — ``page1`` — reads only
-    the first page (``_text_from_pages`` takes ``pages[0]`` and discards the
-    rest), so only ``page_1.json`` is fetched: one blob per file instead of one
-    per page. Every other view (``full``, ``headers``, ``salient_boost``, or any
-    multi-view spec naming them) reads all pages, so all are fetched.
+    ``text_view`` narrows it further — the default view, ``page1``, needs only
+    ``page_1.json``, one blob per file instead of one per page. Which keys a view
+    actually reads is :func:`dgml_core.utils.page_text_keys`'s call, shared with
+    :func:`dgml_core.dataset._file_text_dir`, which materializes the same page
+    text per record into a different directory shape.
 
     A directory is created for **every** id, including ones with no page text, so
     the corpus has one entry per file exactly as the local walk does. That keeps
@@ -857,22 +857,14 @@ def _corpus_dir(workspace: Workspace, file_ids: Sequence[str], text_view: str) -
         yield workspace.files_dir
         return
 
-    from clustering.example import split_view_spec
-
-    first_page_only = all(name == "page1" for name in split_view_spec(text_view))
+    from .utils import page_text_keys
 
     with tempfile.TemporaryDirectory(prefix="dgml-corpus-") as tmp:
         root = Path(tmp)
         for file_id in file_ids:
             (root / file_id).mkdir(parents=True, exist_ok=True)
             prefix = layout.file_text_prefix(file_id)
-            keys = workspace.blobs.list_blobs(prefix)
-            if first_page_only:
-                # Filtered from the listing rather than probed with blob_exists,
-                # so a file with no page text still costs one round trip.
-                wanted = layout.file_page_text_key(file_id, 1)
-                keys = [key for key in keys if key == wanted]
-            for key in keys:
+            for key in page_text_keys(workspace, file_id, text_view):
                 dest = root / file_id / layout.PAGE_TEXT_DIR / key[len(prefix) :]
                 workspace.blobs.download_blob(key, dest)
         yield root

@@ -22,12 +22,61 @@ job.
 from __future__ import annotations
 
 import io
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
 
 from clustering.data.datasets import DocumentDataset, DocumentRecord
 from PIL import Image
 
 from . import layout
 from .storage import Workspace
+from .utils import gather_file_pages
+
+
+@contextmanager
+def _file_text_dir(workspace: Workspace, file_id: str, text_view: str) -> Iterator[Path]:
+    """A local directory holding one file's ``page_text/``, for ``_build_text``.
+
+    ``_build_text`` takes a *file* directory and opens only
+    ``<file_dir>/page_text/page_*.json`` (``clustering.example._load_pages``), so
+    that subtree is all that has to exist locally. ``files/<id>/`` also holds the
+    source document and every rendered page image — the bulk of a workspace, and
+    nothing this reader opens. Materializing the whole prefix is free on
+    ``LocalStore`` and a full per-record download on every other backend; the page
+    images in it would also duplicate the ones ``__getitem__`` already fetched
+    individually.
+
+    Which pages ``text_view`` needs is :func:`dgml_core.utils.page_text_keys`'s
+    call — shared with :func:`dgml_core.clustering._corpus_dir`, which does the
+    same job for a whole corpus. Only the directory shape differs, and that is
+    what stays here.
+    """
+    from .storage_local import LocalStore
+
+    # Exact type, not ``isinstance``: the passthrough is only valid because
+    # ``LocalStore``'s keys *are* paths under the workspace root. A subclass has
+    # changed something — ``DefaultBridgeStore`` in the test suite subclasses it
+    # precisely to keep the primitives but take the download bridge — so the
+    # assumption no longer holds. Materializing for an unknown subclass is slower
+    # and correct; short-circuiting it would be fast and wrong.
+    if type(workspace.blobs) is LocalStore:
+        yield workspace.files_dir / file_id
+        return
+
+    from .utils import page_text_keys
+
+    with tempfile.TemporaryDirectory(prefix="dgml-file-text-") as tmp:
+        root = Path(tmp)
+        # Created even when nothing matches, so ``_load_pages`` sees the same
+        # shape it sees on local disk (an empty dir, not a missing one).
+        page_text = root / layout.PAGE_TEXT_DIR
+        page_text.mkdir()
+        prefix = layout.file_text_prefix(file_id)
+        for key in page_text_keys(workspace, file_id, text_view):
+            workspace.blobs.download_blob(key, page_text / key[len(prefix) :])
+        yield root
 
 
 class WorkspaceFileDataset(DocumentDataset):
@@ -81,19 +130,14 @@ class WorkspaceFileDataset(DocumentDataset):
 
         file_id = self.file_ids[index]
         ws = self.workspace
-        page_keys = ws.blobs.list_blobs(layout.file_pages_prefix(file_id))
-        if not page_keys:
+        # Up to max_pages page renders, for optional multi-page pooling.
+        raw_pages = gather_file_pages(ws, file_id, self.max_pages)
+        if not raw_pages:
             raise FileNotFoundError(f"no rendered page images for file '{file_id}'")
-        # Load the first ``max_pages`` renders for optional multi-page pooling,
-        # reading each through the store (zero-copy on LocalStore). ``page_keys``
-        # is sorted, so this is pages 1..max_pages in order.
-        page_images = tuple(
-            Image.open(io.BytesIO(ws.blobs.get_blob(k))).convert("RGB")
-            for k in page_keys[: self.max_pages]
-        )
-        # `_build_text` reads `<file_dir>/page_text/*.json`; hand it a materialized
-        # copy of the file's artifacts (the real dir on LocalStore, zero-copy).
-        with ws.blobs.materialize_dir(layout.file_prefix(file_id)) as file_dir:
+        page_images = tuple(Image.open(io.BytesIO(b)).convert("RGB") for b in raw_pages)
+        # `_build_text` reads `<file_dir>/page_text/*.json` and nothing else, so
+        # hand it just that (the real dir on LocalStore, zero-copy).
+        with _file_text_dir(ws, file_id, self.text_view) as file_dir:
             text = _build_text(file_dir, view=self.text_view)
         return DocumentRecord(
             doc_id=file_id,

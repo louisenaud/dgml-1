@@ -47,7 +47,7 @@ of workspaces (one addressed by id). There is no flag for pointing at one kept e
 
 Setup — the minimum is a **single** command:
 
-1. `dgml init [--provider <anthropic|google|mixed>]` — **run once per machine.** Writes the user-level `~/.config/dgml/config.toml` with a `[models]` block. Omit `--provider` to auto-detect from the API-key env vars that are set (`ANTHROPIC_API_KEY` / `GEMINI_API_KEY`); pass `--force` to overwrite an existing file (backs it up first). There are **no** default models — an unconfigured model is a hard error, never a silent paid call.
+1. `dgml init [--provider <anthropic|google|mixed|openai>]` — **run once per machine.** Writes the user-level `~/.config/dgml/config.toml` with a `[models]` block. Omit `--provider` to auto-detect from the API-key env vars that are set (`ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `OPENAI_API_KEY`, checked in that order — an OpenAI key never overrides a provider the other two resolve); pass `--force` to overwrite an existing file (backs it up first). There are **no** default models — an unconfigured model is a hard error, never a silent paid call.
 2. `dgml workspace create [path] --organization <org>` — creates the workspace — writing its `config.toml` (the storage binding plus a machine-managed `[workspace]` identity block), records its identity in `workspace.json`, and generates a stable `workspace_id` (echoed in the payload). **Where it goes depends on whether you name a place for it**: with no `path`, no `--workspace` and no `$DGML_HOME`, the workspace is created in the machine's store of workspaces and is listed by `dgml workspace list` (`"listed": true`); give a `path` (`dgml workspace create ./ws …`) and you get a **detached** workspace in that directory, addressed by path and not listed. Prefer the listed form for new work — `--workspace <id>` then opens it from any directory. It does **not** touch the user config; if the config is missing it still creates the workspace and warns on stderr to run `dgml init`. Safe to re-run — an existing `[storage.<name>]` is never overwritten and the recorded id, name and `created_at` are reused. `--organization` is **required for a new workspace** and is embedded in its docset namespace URIs (`http://dgml.io/<org>/<DocSetSlug>`); it becomes **optional** once the config records one (passing a different value re-organizes the workspace and warns on stderr). `--name` is an optional human-readable label. `--id <workspace_id>` sets the stable handle instead of generating one (3 to 40 characters using only lowercase letters, digits, hyphens and underscores, starting with a letter or digit, e.g. `--id my-workspace`) — use it when the id is decided elsewhere or a workspace is being re-created deterministically; an id the store already holds fails with `CONFLICT`, an `--id` matching the workspace's existing id is a no-op, and one that differs from it fails with `INVALID_ARGUMENT` (`create` never re-identifies a workspace). Use `--storage <name>` to materialize a named service defined as `[storage.<name>]` in the user config into this workspace's own config (omit for the bundled local-disk default); `--from-config <path>` starts from a config you authored, copied in verbatim (a template — the source is not tracked, and later edits to it do nothing). The two **compose**: `--from-config` supplies the config, `--storage` says which `[storage.<name>]` table in it to bind to — a config declaring `[storage.acme]` needs `--storage acme`, or create fails with `INVALID_ARGUMENT` rather than silently using local disk.
 
 **Per-workspace config overrides need a config that is a file.** `workspace_config_path` (from `workspace create` or `dgml status`) is the path to append a section like `[ocr]` or `[generation]` to — and it is `null` when the store of workspaces does not keep configs as files (the Mongo backend does not; `config_location` names where it is instead). In that case put the section in the user config, which every workspace layers over, or supply it at create time with `--from-config`. Recipes below guard on this rather than appending blindly: `jq -r` renders a JSON null as the string `null`, so an unguarded `cat >> "$cfg"` silently writes a file called `null` and the setting never takes effect.
@@ -337,20 +337,42 @@ semantic-labeling call assigns concept tags across all of the docset's
 documents at once (`generation.label_model`), and the result is rendered
 deterministically into namespaced `dg:chunk` XML. The labeling vocabulary
 (the "roster") is planned automatically from the documents, or pinned up
-front with `--schema-path` (see below). Unseeded runs are staged: the largest
+front with `--schema-path`, which uses that vocabulary and no other (see below). Unseeded runs are staged: the largest
 documents label first (a pilot) and their observed evidence — verbatim
 examples, kinds, hierarchy — confirms the vocabulary the rest of the batch
 labels against. There is no separate transform pass. The pipeline is part of
 the base `dgml` install and reuses the workspace's pre-rendered `page_images/`.
 
-**Choose the models — config only, no flags.** The models are not CLI flags:
-`generate` reads them solely from the `generation` section of
+**Choose the models — config by default, overridable per run.** By default
+`generate` reads its models solely from the `generation` section of
 `<workspace>/config.toml`, so each is one explicit, visible choice per
-workspace (matching every other model-consuming command). Both are **required**:
-`model` (per-page transcription) and `label_model` (the
-single batch-wide labeling call — a stronger model here is cheap). Without a
-`generation` section, `generate` fails with `GENERATION_CONFIG_MISSING`. See
-the `generation` config in [storage-layout.md](../../../docs/storage-layout.md).
+workspace. Both are **required**: `model` (per-page transcription) and
+`label_model` (the single batch-wide labeling call — a stronger model here is
+cheap). Without a `generation` section, an un-overridden `generate` fails with
+`GENERATION_CONFIG_MISSING`. See the `generation` config in
+[storage-layout.md](../../../docs/storage-layout.md).
+
+To run against an explicit model config **without editing `config.json`** (e.g.
+a cheap smoke-test run, or an A/B), use the override flags — they mirror `dgml
+cluster --config`. Precedence: `--model`/`--label-model` > `--generation-config`
+> the workspace config.
+
+```bash
+# Bundled profile (fast | balanced | quality) — replaces the generation
+# section for this run; works even with no generation config present:
+uv run dgml docset generate "$ds" --generation-config fast
+
+# Or a checked-in standalone config file (same shape as the generation section):
+uv run dgml docset generate "$ds" --generation-config ./configs/gen-quality.json
+
+# Or override just one model string on top of the config:
+uv run dgml docset generate "$ds" --label-model anthropic/claude-opus-4-8
+```
+
+Whatever the source, the run records the effective models in its JSON output's
+`models` block (`{model, label_model, source}`) — so the choice stays visible,
+never silent. `source` is `config`, `profile:<name>`, `file`, `override`, or a
+combination (`profile:fast+override`).
 
 Grounding runs in place as part of `generate`, adding `dg:origin` boxes and —
 when observable in the source — `dg:style` (inline CSS for bold/italic/size/
@@ -402,30 +424,82 @@ for fid in $(jq -r '.results[] | select(.file) | .file.id' <<<"$payload"); do
   uv run dgml docset add-file --workspace "$wid" "$fid" --docset "$ds"
 done
 
-# Models come from config.toml — there are no --model/--label-model flags.
+# Models come from config.toml by default; override per run with
+# --generation-config / --model / --label-model (see "Choose the models" above).
 uv run dgml docset generate --workspace "$wid" "$ds"
 ```
 
-**Pin the vocabulary for consistent labels (`--schema-path`).** Labeling is
-non-deterministic run-to-run; to lock the concept vocabulary, pass a schema a
-prior run exported — `schema.json` (Schema v1: a `tags` map of concept name →
-`{role, kind, parent_role, …}`) or its RELAX NG Compact render `full-schema.rnc`
-(both land at the docset root; the `.rnc` is the human-friendly editing
-surface and reverses losslessly). The planning pass is skipped and that
-vocabulary is used as-is with full fidelity — role descriptions, curated
-examples, and kind all feed the labeling prompt, and the tag hierarchy
-(`parent_role`) also seeds entity-container grouping — and per-document
-labeling still extends it for roles it doesn't cover. Only these exported
-formats are accepted (not a flat `{concept: description}` mapping). The
-natural loop is "generate once, review/curate the schema, then reuse it":
+**Pin the vocabulary (`--schema-path`) — all or nothing.** Labeling is
+non-deterministic run-to-run; supplying a schema locks the concept vocabulary.
+The planning pass is skipped and the generated DGML uses those tag names **and
+no others**. Content whose role has no matching tag is not dropped — it renders
+as `dg:chunk` with its text, structure, and `dg:origin` intact.
+
+Two modes, for two situations. `--schema-path X` alone is **strict** — your tag
+names and no others, for when the schema is the specification. Adding
+`--extend-schema` makes it a **foundation**: your names are reused wherever one
+fits, and a recurring role your schema doesn't cover may be coined, with every
+coinage reported per file under `added_concepts` so you can fold it into the
+next revision. Strict reports the mirror image as `unmatched_concepts` — what it
+had to refuse. The mode is per-run; the schema is remembered, the flag is not.
+
+How much output stays under the user's tags depends on **how much of the
+document the schema covers**, not on tag count — the same schema can carry most
+of a short regular document and a quarter of a long dense one. On rich
+documents extend adds far more than it reuses and `added_concepts` gets long:
+that is the mode working (real recurring roles the schema doesn't name), but
+the output is then mostly not the user's vocabulary. To keep it dominant on a
+dense corpus, grow the schema or use strict.
+
+Use extend as a **step in a loop, not a standing setting**: the tags it coins
+are unstable run-to-run, so run it, review `added_concepts`, fold what you want
+into the schema, then run strict for output you intend to keep. Neither mode
+improves extraction accuracy over a no-schema run — what a supplied schema buys
+is vocabulary control.
+
+Four input forms, detected by content:
+
+- **a plain tag list** — one name per line, `#` comments and blanks ignored;
+- **`{name: one-line description}` JSON** — recommended; the description is what
+  the model matches content against;
+- **`schema.json`** (Schema v1: a `tags` map of name → `{role, kind, examples,
+  parent_role}`) — what `generate` exports;
+- **`full-schema.rnc`** — the same, as commented RELAX NG Compact; the
+  human-friendly editing surface, and it reverses losslessly.
+
+Write `role` descriptions; skip `examples`. Testing found no benefit, and a
+way they hurt: tags carrying examples get used less while tags without them
+absorb that content — the example reads as a fence rather than a hint.
+
+Tag names are taken **verbatim** — `Notes`, `Details` and `Line Items` all
+survive; only XML-illegal characters become underscores (`Line Items` →
+`Line_Items`, reported under `--verbose`). Matching ignores case and separators
+(`customer_name` → `CustomerName`) but **not** word differences:
+`NameOfCustomer` is rejected, not mapped. Each converted file's `results` entry
+gains `unmatched_concepts` `{count, distinct, examples}` listing what was
+refused — read it; it is the fastest way to find gaps in the schema. Note that
+`ColumnHeader`, which the renderer emits for a table's printed column-title row,
+is subject to the same rule: declare it if you want those cells tagged.
+
+A supplied schema is stored at `docsets/<id>/authored-schema.json`, which the
+derived `schema.json` never overwrites — so later runs re-seed from what you
+wrote, not from `yours + everything coined`.
 
 ```bash
-# 1) first run plans the vocabulary and exports it to docsets/<id>/schema.json
-#    (+ full-schema.rnc, the same schema as commented RELAX NG Compact)
+# Hand-written vocabulary — the recommended shape. ~30 tags with one-line
+# roles beat both a bare name list and names-plus-example-values.
+cat > /tmp/po-tags.json <<'JSON'
+{ "CustomerName": "Legal name of the customer placing the order",
+  "PurchaseOrderNumber": "Identifier the customer assigned to this order",
+  "OrderDate": "Date the order was placed",
+  "PaymentTerms": "Terms governing when payment is due" }
+JSON
+uv run dgml docset generate --workspace "$wid" "$ds" --schema-path /tmp/po-tags.json
+
+# Or: generate once, curate the export, feed it back. --schema-path needs a
+# local file, so take the workspace root from `status` rather than assuming one —
+# this step is local-store only: on a remote blob backend the export has no path.
 uv run dgml docset generate --workspace "$wid" "$ds"
-# 2) reuse (optionally hand-curate) either export on later runs. --schema-path needs a
-#    local file, so take the workspace root from `status` rather than assuming one — and
-#    note this step is local-store only: on a remote blob backend the export has no path.
 root=$(uv run dgml status --workspace "$wid" | jq -r .workspace)
 uv run dgml docset generate --workspace "$wid" "$ds" \
   --schema-path "$root/docsets/$ds/full-schema.rnc"
@@ -499,10 +573,14 @@ generate builds its tree and carries the existing `dg:extraction` over
 
 **Growing a docset (add docs later, stay consistent).** Because existing files
 are skipped, adding a document and re-running generates only the new one — and
-by default it's labeled seeded with the docset's own `schema.json` (full
-fidelity: descriptions, observed examples, kind, hierarchy; falls back to the
-flat `cache/concept_roster.json`), so its tags stay consistent with the rest
-(no `--schema-path` needed). Every concept is emitted in the `docset:` vocabulary
+by default it's labeled seeded with the docset's own `authored-schema.json` if a
+previous `--schema-path` run supplied one, else its derived `schema.json` (full
+fidelity: descriptions, observed examples, kind, hierarchy), else the flat
+`cache/concept_roster.json`, so its tags stay consistent with the rest (no
+`--schema-path` needed). A remembered **authored** schema closes the vocabulary
+the same way `--schema-path` does; a schema the pipeline **derived** only seeds,
+so an ordinary incremental run still coins for roles it doesn't cover and is
+unaffected by this feature. Every concept is emitted in the `docset:` vocabulary
 namespace (`dg:` is framework-only), so growing the docset never flips a tag's
 prefix; an already-generated file is still re-rendered deterministically when
 its output otherwise changes as the docset's schema/roster grows (reported under
@@ -518,8 +596,9 @@ uv run dgml docset generate "$ds"   # only the new file; reuses the docset schem
 single JSON object on stdout — pipe it straight to `jq`. Pass 1/2/4
 progress lines go to stderr and only under `--verbose`. The payload is the
 shared batch envelope: a `summary` count block (`{total, converted, skipped,
-failed}`) plus a per-item `results` array, each entry carrying a
-`status` (`converted` / `skipped` / `failed`). A top-level `rerendered` lists
+failed}`), a `models` block recording the effective models and their `source`
+(`{model, label_model, source}`), plus a per-item `results` array, each entry
+carrying a `status` (`converted` / `skipped` / `failed`). A top-level `rerendered` lists
 already-generated files re-rendered because the docset namespacing shifted. A file whose source has gone
 missing is a `failed` entry (with an `error` object) rather than a run-level
 abort — the batch finishes and exits 0, so check `summary.failed` and surface

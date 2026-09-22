@@ -518,6 +518,139 @@ def test_corpus_covers_every_file_not_just_the_ones_being_clustered(tmp_path: Pa
 
 
 # ---------------------------------------------------------------------------
+# per-record text materialization — dataset._file_text_dir
+#
+# The single-file twin of ``_corpus_dir`` above. Kept adjacent because the two
+# narrowing rules have to stay in step.
+# ---------------------------------------------------------------------------
+
+
+def _seeded_bridge_workspace(tmp_path: Path, pages: int = 3) -> Workspace:
+    """A bridge-store workspace with one file carrying a page image, the source
+    document, and ``pages`` pages of text."""
+    ws = _bridge_workspace(tmp_path)
+    _seed_file(ws, "f1")
+    _seed_page_image(ws, "f1")
+    # The stored original — the single biggest blob under ``files/<id>/`` and the
+    # clearest proof the text path is no longer dragging the whole prefix down.
+    ws.blobs.put_blob(layout.file_source_key("f1", "f1.pdf"), b"%PDF-1.7 fake")
+    for page in range(1, pages + 1):
+        ws.blobs.put_blob(
+            layout.file_page_text_key("f1", page),
+            json.dumps(
+                {"page_number": page, "words": [{"t": f"w{page}", "l": [0, 0, 8, 12]}]}
+            ).encode(),
+        )
+    return ws
+
+
+def test_record_text_fetches_no_page_images_or_source_document(tmp_path: Path) -> None:
+    """The regression #130 names: building ``record.text`` used to materialize the
+    whole ``files/<id>/`` prefix — source document and every page render included —
+    on every access, once per record per clustering pass.
+
+    The page images are the sharpest case: ``__getitem__`` already fetched them
+    individually through ``get_blob`` two lines earlier, so every byte of them in
+    the materialized tree was a duplicate download.
+    """
+    ws = _seeded_bridge_workspace(tmp_path)
+    downloaded: list[str] = []
+    original = type(ws.blobs).download_blob
+
+    def _spy(self: Any, key: str, dest: Path) -> None:
+        downloaded.append(key)
+        original(self, key, dest)
+
+    with patch.object(type(ws.blobs), "download_blob", _spy):
+        record = WorkspaceFileDataset(ws, ["f1"], text_view="full")[0]
+
+    assert record.text == "w1 w2 w3"  # all three pages still read
+    assert downloaded  # the text path really did go through the bridge
+    assert not [k for k in downloaded if layout.PAGE_IMAGES_DIR in k]
+    assert not [k for k in downloaded if k.endswith(".pdf")]
+    assert all(k.startswith(layout.file_text_prefix("f1")) for k in downloaded)
+
+
+@pytest.mark.parametrize(
+    ("text_view", "expected_pages"),
+    [
+        ("page1", ["page_1.json"]),  # the default: only the first page is read
+        ("full", ["page_1.json", "page_2.json", "page_3.json"]),
+    ],
+)
+def test_record_text_fetches_only_the_pages_the_view_reads(
+    tmp_path: Path, text_view: str, expected_pages: list[str]
+) -> None:
+    """The per-record half of the narrowing: the directory holds exactly the pages
+    the view reads, in the shape ``_build_text`` expects, and is cleaned up after.
+
+    The rule itself lives in ``utils.page_text_keys`` and is parametrized across
+    every view by ``test_corpus_fetches_only_the_pages_the_view_reads`` above —
+    the two views here are the two distinct behaviours (narrowed / not), enough
+    to catch this caller wiring the shared rule up wrong.
+    """
+    from dgml_core.dataset import _file_text_dir
+
+    ws = _seeded_bridge_workspace(tmp_path)
+
+    with _file_text_dir(ws, "f1", text_view) as file_dir:
+        got = sorted(p.name for p in (file_dir / layout.PAGE_TEXT_DIR).iterdir())
+        held = file_dir
+    assert got == expected_pages
+    # Cleaned up on exit — it is a temp tree, not workspace state.
+    assert not held.exists()
+
+
+@pytest.mark.parametrize("text_view", ["page1", "full"])
+def test_record_text_is_identical_across_backends(tmp_path: Path, text_view: str) -> None:
+    """The narrowing must not change what a view reads. Same workspace content,
+    LocalStore vs the bridge — identical text, or the same workspace would cluster
+    differently depending on its storage backend.
+
+    This is the outcome half of the pair: the test above asserts *which blobs are
+    fetched*, this one that the text built from them is right. That is what
+    catches a narrowing which silently truncates — and it covers the LocalStore
+    passthrough too, since yielding the wrong directory there produces empty text
+    on one side only.
+    """
+    bridge = _seeded_bridge_workspace(tmp_path / "bridge")
+
+    local = Workspace(root=tmp_path / "local" / "ws")
+    local.root.mkdir(parents=True)
+    _seed_file(local, "f1")
+    _seed_page_image(local, "f1")
+    local.blobs.put_blob(layout.file_source_key("f1", "f1.pdf"), b"%PDF-1.7 fake")
+    for page in range(1, 4):
+        local.blobs.put_blob(
+            layout.file_page_text_key("f1", page),
+            json.dumps(
+                {"page_number": page, "words": [{"t": f"w{page}", "l": [0, 0, 8, 12]}]}
+            ).encode(),
+        )
+
+    assert (
+        WorkspaceFileDataset(bridge, ["f1"], text_view=text_view)[0].text
+        == WorkspaceFileDataset(local, ["f1"], text_view=text_view)[0].text
+    )
+
+
+def test_record_text_is_empty_for_a_file_with_no_page_text(tmp_path: Path) -> None:
+    """The scanned-PDF case: page images but no extracted text. Must be empty text
+    on both backends, not a new exception from the narrowed materializer."""
+    bridge = _bridge_workspace(tmp_path / "bridge")
+    _seed_file(bridge, "f1")
+    _seed_page_image(bridge, "f1")
+
+    local = Workspace(root=tmp_path / "local" / "ws")
+    local.root.mkdir(parents=True)
+    _seed_file(local, "f1")
+    _seed_page_image(local, "f1")
+
+    assert WorkspaceFileDataset(bridge, ["f1"])[0].text == ""
+    assert WorkspaceFileDataset(local, ["f1"])[0].text == ""
+
+
+# ---------------------------------------------------------------------------
 # incremental novelty-gate default — _with_incremental_novelty_default
 # ---------------------------------------------------------------------------
 

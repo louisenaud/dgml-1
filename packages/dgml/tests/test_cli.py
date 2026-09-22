@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -130,6 +131,35 @@ def test_init_provider_flag_forces_table(
     assert rc == 0
     assert _read_stdout(capsys)["provider"] == "google"
     assert "gemini/" in user_config_path().read_text(encoding="utf-8")
+
+
+def test_init_provider_openai_writes_openai_table(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from dgml_core.storage import user_config_path
+
+    rc = main(_ws_args(tmp_path / "ws") + ["init", "--provider", "openai"])
+    assert rc == 0
+    assert _read_stdout(capsys)["provider"] == "openai"
+    assert "openai/gpt-" in user_config_path().read_text(encoding="utf-8")
+
+
+def test_init_auto_detects_openai_from_its_key_alone(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With only OPENAI_API_KEY set, auto-detection resolves to `openai`."""
+    from dgml_core.storage import user_config_path
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-dummy")
+
+    rc = main(_ws_args(tmp_path / "ws") + ["init"])
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    assert payload["provider"] == "openai"
+    assert payload["detected_keys"] == ["OPENAI_API_KEY"]
+    assert "openai/gpt-" in user_config_path().read_text(encoding="utf-8")
 
 
 def test_init_provider_without_force_does_not_clobber(
@@ -2483,19 +2513,34 @@ def test_docset_generate_cache_dir_and_debug_threading(
     assert _run([], ["--cache-dir", str(explicit)]).cache_dir == explicit
 
 
-def test_docset_generate_has_no_model_flags() -> None:
-    """The model is config-only — there are no --model / --label-model flags, so
-    which model runs is a single per-workspace choice (config.toml), matching
-    every other model-consuming command. Passing the removed flags is rejected."""
+def test_docset_generate_model_flags_default_to_config() -> None:
+    """The workspace 'generation' config is still the default source: the model
+    flags parse and default to None (no override), so a plain run is unchanged.
+    --generation-config / --model / --label-model let a run name an explicit
+    model config without hand-editing config.toml."""
     from dgml.cli import _build_parser
 
     args = _build_parser().parse_args(["docset", "generate", "somedocset"])
-    assert not hasattr(args, "model")
-    assert not hasattr(args, "label_model")
-    with pytest.raises(SystemExit):
-        _build_parser().parse_args(["docset", "generate", "d", "--model", "x"])
-    with pytest.raises(SystemExit):
-        _build_parser().parse_args(["docset", "generate", "d", "--label-model", "x"])
+    assert args.generation_config is None
+    assert args.model is None
+    assert args.label_model is None
+
+    args = _build_parser().parse_args(
+        [
+            "docset",
+            "generate",
+            "d",
+            "--generation-config",
+            "fast",
+            "--model",
+            "anthropic/claude-haiku-4-5",
+            "--label-model",
+            "anthropic/claude-sonnet-4-6",
+        ]
+    )
+    assert args.generation_config == "fast"
+    assert args.model == "anthropic/claude-haiku-4-5"
+    assert args.label_model == "anthropic/claude-sonnet-4-6"
 
 
 @needs_gs
@@ -2552,10 +2597,103 @@ def test_docset_generate_models_from_config(
     with patch("dgml_core.generation.convert_batch", side_effect=fake_convert) as mock_batch:
         rc = main(_ws_args(ws) + ["docset", "generate", did, "--no-coverage"])
     assert rc == 0
-    capsys.readouterr()
+    payload = _read_stdout(capsys)
     opts = mock_batch.call_args.kwargs["options"]
     assert opts.model == "anthropic/claude-haiku-4-5"
     assert opts.label_model == "anthropic/claude-sonnet-4-6"
+    # The effective models are recorded in the output so the choice is visible.
+    assert payload["models"] == {
+        "model": "anthropic/claude-haiku-4-5",
+        "label_model": "anthropic/claude-sonnet-4-6",
+        "source": "config",
+    }
+
+
+@needs_gs
+def test_docset_generate_model_flags_override_config(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--model / --label-model override the workspace config for the run, and the
+    override (and its source) is recorded in the output's `models` block."""
+    ws = tmp_path / "ws"
+    did = _init_with_docset(ws, capsys)
+    Workspace(root=ws).config_path.write_text(
+        dump_toml(
+            {
+                "generation": {
+                    "model": "anthropic/claude-haiku-4-5",
+                    "label_model": "anthropic/claude-sonnet-4-6",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    main(_ws_args(ws) + ["file", "add", str(text_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+    main(_ws_args(ws) + ["docset", "add-file", fid, "--docset", did])
+    capsys.readouterr()
+
+    def fake_convert(
+        paths: object, *, options: object, on_output: Any, **_kw: object
+    ) -> dict[str, str]:
+        on_output("with-text.pdf", "<xml/>")
+        return {}
+
+    with patch("dgml_core.generation.convert_batch", side_effect=fake_convert) as mock_batch:
+        rc = main(
+            _ws_args(ws)
+            + [
+                "docset",
+                "generate",
+                did,
+                "--no-coverage",
+                "--label-model",
+                "anthropic/claude-opus-4-8",
+            ]
+        )
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    opts = mock_batch.call_args.kwargs["options"]
+    assert opts.model == "anthropic/claude-haiku-4-5"  # unchanged
+    assert opts.label_model == "anthropic/claude-opus-4-8"  # overridden
+    assert payload["models"] == {
+        "model": "anthropic/claude-haiku-4-5",
+        "label_model": "anthropic/claude-opus-4-8",
+        "source": "override",
+    }
+
+
+@needs_gs
+def test_docset_generate_profile_without_config(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--generation-config <profile> runs against a bundled model config even
+    when the workspace config.toml has no 'generation' section — the whole point
+    of the flag. The profile name is recorded as the source."""
+    ws = tmp_path / "ws"
+    did = _init_with_docset(ws, capsys)
+    # No 'generation' section written to config.toml.
+    main(_ws_args(ws) + ["file", "add", str(text_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+    main(_ws_args(ws) + ["docset", "add-file", fid, "--docset", did])
+    capsys.readouterr()
+
+    def fake_convert(
+        paths: object, *, options: object, on_output: Any, **_kw: object
+    ) -> dict[str, str]:
+        on_output("with-text.pdf", "<xml/>")
+        return {}
+
+    with patch("dgml_core.generation.convert_batch", side_effect=fake_convert) as mock_batch:
+        rc = main(
+            _ws_args(ws)
+            + ["docset", "generate", did, "--no-coverage", "--generation-config", "fast"]
+        )
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    opts = mock_batch.call_args.kwargs["options"]
+    assert opts.model == opts.label_model  # fast tier: same cheap model for both
+    assert payload["models"]["source"] == "profile:fast"
 
 
 @needs_gs
@@ -2732,6 +2870,248 @@ def test_docset_generate_reuse_prefers_schema_json(
     assert seed is not None and seed.tags["ClientName"].examples == ["Acme Pty Ltd"]
     assert options.roster_seed is None
     assert options.parent_map is None  # grouping stays --schema-path opt-in
+
+
+def _generate_with_stub_batch(
+    ws: Path, did: str, extra: list[str], *, on_output_name: str = "with-text.pdf"
+) -> Any:
+    """Run `docset generate` with convert_batch stubbed out, returning the mock.
+
+    Everything these tests care about — which seed was chosen, whether the
+    vocabulary closed, what reached the JSON payload — is decided around the
+    pipeline call, so the pipeline itself is replaced by a stub that emits one
+    document. Keeps the tests free of the model and of ghostscript.
+    """
+
+    def fake_convert(
+        paths: object, *, options: object, on_output: Any, **_kw: object
+    ) -> dict[str, str]:
+        on_output(on_output_name, "<xml/>")
+        return {}
+
+    with patch("dgml_core.generation.convert_batch", side_effect=fake_convert) as mock_batch:
+        rc = main(_ws_args(ws) + ["docset", "generate", did, "--no-coverage", *extra])
+    assert rc == 0
+    return mock_batch
+
+
+def _docset_with_one_file(ws: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]) -> str:
+    did = _init_with_docset(ws, capsys)
+    main(_ws_args(ws) + ["file", "add", str(text_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+    main(_ws_args(ws) + ["docset", "add-file", fid, "--docset", did])
+    capsys.readouterr()
+    return did
+
+
+def test_docset_generate_schema_path_closes_the_vocabulary(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Supplying a schema is all-or-nothing: the output carries those tag names
+    and no others, with no flag to half-apply it. To let labeling invent its own
+    vocabulary, don't supply a schema."""
+    ws = tmp_path / "ws"
+    did = _docset_with_one_file(ws, text_pdf, capsys)
+    schema_path = tmp_path / "tags.txt"
+    schema_path.write_text("PaymentTerms\nDueDate\n", encoding="utf-8")
+
+    mock = _generate_with_stub_batch(ws, did, ["--schema-path", str(schema_path)])
+    vocab = mock.call_args.kwargs["options"].vocab
+    assert vocab.closed and vocab.names == {"PaymentTerms", "DueDate"}
+
+
+def test_docset_generate_closes_only_on_an_authored_vocabulary(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Closure keys on AUTHORSHIP, not on the presence of a seed.
+
+    A vocabulary a person wrote is a specification and is applied as one. A
+    vocabulary the pipeline derived from its own previous labels is a
+    consistency hint, so automatic reuse of `schema.json` seeds exactly as it
+    always has and keeps coining — an ordinary incremental generate is
+    unaffected by this feature existing.
+    """
+    ws = tmp_path / "ws"
+    did = _docset_with_one_file(ws, text_pdf, capsys)
+    docset_dir = ws / "docsets" / did
+    docset_dir.mkdir(parents=True, exist_ok=True)
+    (docset_dir / "schema.json").write_text(
+        json.dumps({"tags": {"ClientName": {"name": "ClientName", "role": "the client"}}}),
+        encoding="utf-8",
+    )
+
+    # Derived schema.json: seeds, does NOT close.
+    options = _generate_with_stub_batch(ws, did, []).call_args.kwargs["options"]
+    assert options.vocab.names == {"ClientName"}
+    assert not options.vocab.closed
+
+    # No seed at all.
+    capsys.readouterr()
+    options = _generate_with_stub_batch(ws, did, ["--no-roster"]).call_args.kwargs["options"]
+    assert not options.vocab.names and not options.vocab.closed
+
+    # A remembered AUTHORED schema closes, with no flag and no re-supply — it
+    # outranks the derived schema.json sitting beside it.
+    capsys.readouterr()
+    (docset_dir / "authored-schema.json").write_text(
+        json.dumps({"tags": {"PaymentTerms": {"name": "PaymentTerms", "role": "when due"}}}),
+        encoding="utf-8",
+    )
+    options = _generate_with_stub_batch(ws, did, []).call_args.kwargs["options"]
+    assert options.vocab.names == {"PaymentTerms"}
+    assert options.vocab.closed
+
+
+def test_docset_generate_extend_schema_keeps_the_vocabulary_open(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--extend-schema is the second use case: the supplied schema is a
+    foundation the run may add to, not the whole vocabulary."""
+    ws = tmp_path / "ws"
+    did = _docset_with_one_file(ws, text_pdf, capsys)
+    schema_path = tmp_path / "tags.txt"
+    schema_path.write_text("PaymentTerms\nDueDate\n", encoding="utf-8")
+
+    opts = _generate_with_stub_batch(
+        ws, did, ["--schema-path", str(schema_path), "--extend-schema"]
+    ).call_args.kwargs["options"]
+    assert opts.vocab.names == {"PaymentTerms", "DueDate"}
+    assert opts.vocab.authored and not opts.vocab.closed and opts.vocab.extends
+
+    # …and a remembered authored schema extends the same way, no re-supply.
+    capsys.readouterr()
+    opts = _generate_with_stub_batch(ws, did, ["--extend-schema"]).call_args.kwargs["options"]
+    assert opts.vocab.extends and opts.vocab.names == {"PaymentTerms", "DueDate"}
+    # The MODE is per-run, not remembered: a bare run goes back to strict.
+    capsys.readouterr()
+    assert _generate_with_stub_batch(ws, did, []).call_args.kwargs["options"].vocab.closed
+
+
+def test_docset_generate_extend_schema_requires_a_schema(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With nothing to extend the flag is meaningless, so it fails loudly
+    rather than silently doing nothing."""
+    ws = tmp_path / "ws"
+    did = _docset_with_one_file(ws, text_pdf, capsys)
+    assert main(_ws_args(ws) + ["docset", "generate", did, "--no-coverage", "--extend-schema"]) == 1
+    assert _read_stderr(capsys)["error"]["code"] == "INVALID_ARGUMENT"
+
+
+def test_docset_generate_reports_added_concepts_under_extend_schema(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The same channel reports refusals under strict and additions under
+    extend — the second being the candidate list for the next schema."""
+    ws = tmp_path / "ws"
+    did = _docset_with_one_file(ws, text_pdf, capsys)
+    schema_path = tmp_path / "tags.txt"
+    schema_path.write_text("PaymentTerms\n", encoding="utf-8")
+
+    def fake_convert(
+        paths: object, *, options: object, on_output: Any, on_off_schema: Any, **_kw: object
+    ) -> dict[str, str]:
+        on_off_schema("with-text.pdf", Counter({"DeliveryDate": 2}))
+        on_output("with-text.pdf", "<xml/>")
+        return {}
+
+    for extra, key in ((["--extend-schema"], "added_concepts"), ([], "unmatched_concepts")):
+        capsys.readouterr()
+        with patch("dgml_core.generation.convert_batch", side_effect=fake_convert):
+            main(
+                _ws_args(ws)
+                + ["docset", "generate", did, "--no-coverage", "--schema-path", str(schema_path)]
+                + extra
+            )
+        entry = next(r for r in _read_stdout(capsys)["results"] if r["status"] == "converted")
+        assert entry[key] == {"count": 2, "distinct": 1, "examples": ["DeliveryDate"]}
+        assert len([k for k in entry if k.endswith("_concepts")]) == 1
+
+
+def test_docset_generate_protects_the_authored_schema_from_its_own_output(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """W3 — a seeded run must not become its own next input.
+
+    `derive_schema` rewrites schema.json at the end of every run with `seed
+    union everything coined`, and the next run auto-seeds from it. Parking the
+    authored vocabulary in its own slot is what makes a seeded run repeatable.
+    """
+    ws = tmp_path / "ws"
+    did = _docset_with_one_file(ws, text_pdf, capsys)
+    docset_dir = ws / "docsets" / did
+    schema_path = tmp_path / "tags.txt"
+    schema_path.write_text("PaymentTerms\nDueDate\n", encoding="utf-8")
+
+    _generate_with_stub_batch(ws, did, ["--schema-path", str(schema_path)])
+    authored = json.loads((docset_dir / "authored-schema.json").read_text(encoding="utf-8"))
+    assert set(authored["tags"]) == {"PaymentTerms", "DueDate"}
+
+    # A later run, with no flags at all, re-seeds from the AUTHORED vocabulary
+    # even though a (polluted) derived schema.json sits beside it.
+    (docset_dir / "schema.json").write_text(
+        json.dumps(
+            {
+                "tags": {
+                    "PaymentTerms": {"name": "PaymentTerms", "role": "x"},
+                    "DueDate": {"name": "DueDate", "role": "x"},
+                    "CoinedDuringLabeling": {"name": "CoinedDuringLabeling", "role": "x"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+    options = _generate_with_stub_batch(ws, did, []).call_args.kwargs["options"]
+    assert options.vocab.names == {"PaymentTerms", "DueDate"}
+    assert options.vocab.closed
+    # …and the authored bytes are still exactly what the run started from.
+    assert json.loads((docset_dir / "authored-schema.json").read_text(encoding="utf-8")) == authored
+
+
+def test_docset_generate_reports_unmatched_concepts_per_file(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """W4 — the rejection list is the run's most actionable output, so it rides
+    in the JSON payload rather than only in --verbose logging."""
+    ws = tmp_path / "ws"
+    did = _docset_with_one_file(ws, text_pdf, capsys)
+    schema_path = tmp_path / "tags.txt"
+    schema_path.write_text("PaymentTerms\n", encoding="utf-8")
+
+    def fake_convert(
+        paths: object, *, options: object, on_output: Any, on_off_schema: Any, **_kw: object
+    ) -> dict[str, str]:
+        on_off_schema("with-text.pdf", Counter({"NameOfCustomer": 3, "DueDate": 1}))
+        on_output("with-text.pdf", "<xml/>")
+        return {}
+
+    with patch("dgml_core.generation.convert_batch", side_effect=fake_convert):
+        assert (
+            main(
+                _ws_args(ws)
+                + ["docset", "generate", did, "--no-coverage", "--schema-path", str(schema_path)]
+            )
+            == 0
+        )
+    entry = next(r for r in _read_stdout(capsys)["results"] if r["status"] == "converted")
+    assert entry["unmatched_concepts"] == {
+        "count": 4,
+        "distinct": 2,
+        "examples": ["NameOfCustomer", "DueDate"],
+    }
+
+
+def test_docset_generate_omits_unmatched_concepts_when_nothing_was_refused(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Conditional keys stay conditional — an open run's payload is unchanged,
+    and JSON output is API surface."""
+    ws = tmp_path / "ws"
+    did = _docset_with_one_file(ws, text_pdf, capsys)
+    _generate_with_stub_batch(ws, did, [])
+    entry = next(r for r in _read_stdout(capsys)["results"] if r["status"] == "converted")
+    assert "unmatched_concepts" not in entry
 
 
 @needs_gs
@@ -3419,7 +3799,8 @@ def _generate_with_xml(
         on_output("contract.pdf", xml)
         return {}
 
-    # generate reads the models from config.toml's 'generation' section (no flags).
+    # generate reads the models from config.toml's 'generation' section by
+    # default (this run passes no override flags).
     # Real-provider model strings so the pre-flight check (get_llm_provider)
     # accepts them; convert_batch is mocked, so no call is ever made. The dummy
     # ANTHROPIC_API_KEY from conftest satisfies the pre-flight key check.
@@ -4523,7 +4904,7 @@ def test_load_schema_seed_json_builds_roster_and_parent_map(tmp_path: Path) -> N
         ),
         encoding="utf-8",
     )
-    schema, parent_map = _load_schema_seed(p)
+    schema, parent_map, _notes = _load_schema_seed(p)
     assert {"PartyInformation", "PartyAddress", "OrderDate"} <= set(schema.tags)
     assert schema.tags["PartyAddress"].role == "address"
     assert schema.tags["PartyInformation"].kind == "section"  # fidelity kept, not flattened
@@ -4545,12 +4926,12 @@ def test_load_schema_seed_accepts_rnc(tmp_path: Path) -> None:
         "  mixed { any.docset* }\n}\n\n"
         "# " + "-" * 20 + "\n"
         '# Description: "address"\n'
-        "# Kind: field\n"
+        "# Kind: inline\n"
         "# Parent: PartyInformation\n"
         "PartyAddress = element PartyAddress {\n  common.atts,\n  text\n}\n",
         encoding="utf-8",
     )
-    schema, parent_map = _load_schema_seed(p)
+    schema, parent_map, _notes = _load_schema_seed(p)
     assert {tag.name: tag.role for tag in schema.tags.values()} == {
         "PartyInformation": "party block",
         "PartyAddress": "address",
@@ -4558,21 +4939,79 @@ def test_load_schema_seed_accepts_rnc(tmp_path: Path) -> None:
     assert parent_map == {"PartyAddress": "PartyInformation"}
 
 
-def test_load_schema_seed_rejects_non_schema_input(tmp_path: Path) -> None:
-    """--schema-path accepts only an exported schema (a `tags` map); a flat
-    {concept: description} mapping, non-schema text, or a missing file is rejected."""
+def test_load_schema_seed_accepts_a_plain_tag_list(tmp_path: Path) -> None:
+    """Form A — one bare tag name per line, `#` comments and blanks ignored.
+
+    Names are taken VERBATIM: `Notes` and `Details` survive (`sanitize_concept`
+    would fold both to ''), and only XML validity is enforced, which turns
+    `Line Items` into `Line_Items` and says so in the notes."""
+    from dgml.cli import _load_schema_seed
+
+    p = tmp_path / "tags.txt"
+    p.write_text(
+        "# Liquor distribution purchase orders\n\nCustomerName\nNotes\n"
+        "Details\nLine Items\nAgreementSummary\n",
+        encoding="utf-8",
+    )
+    schema, parent_map, notes = _load_schema_seed(p)
+    assert list(schema.tags) == [
+        "CustomerName",
+        "Notes",
+        "Details",
+        "Line_Items",
+        "AgreementSummary",
+    ]
+    assert all(tag.kind == "inline" for tag in schema.tags.values())
+    assert parent_map == {}
+    assert any("Line Items" in note and "Line_Items" in note for note in notes)
+    assert any("kind=inline" in note for note in notes)
+
+
+def test_load_schema_seed_accepts_a_name_to_description_mapping(tmp_path: Path) -> None:
+    """Form B — the recommended shape. Previously rejected outright."""
+    from dgml.cli import _load_schema_seed
+
+    p = tmp_path / "schema.json"
+    p.write_text(
+        json.dumps({"BuyerName": "bill-to org", "OrderDate": "date the order was placed"}),
+        encoding="utf-8",
+    )
+    schema, parent_map, _notes = _load_schema_seed(p)
+    assert {n: t.role for n, t in schema.tags.items()} == {
+        "BuyerName": "bill-to org",
+        "OrderDate": "date the order was placed",
+    }
+    assert parent_map == {}
+
+
+def test_load_schema_seed_rejects_ambiguous_input(tmp_path: Path) -> None:
+    """What cannot be read UNAMBIGUOUSLY fails at load, never as a tag that
+    quietly failed to appear in the output hours later."""
     from dgml.cli import _load_schema_seed
     from dgml_core.errors import InvalidArgument
 
-    flat = tmp_path / "roster.json"  # old concept_roster shape — no `tags`
-    flat.write_text(json.dumps({"BuyerName": "bill-to org"}), encoding="utf-8")
-    with pytest.raises(InvalidArgument):
-        _load_schema_seed(flat)
+    def _reject(name: str, text: str) -> str:
+        p = tmp_path / name
+        p.write_text(text, encoding="utf-8")
+        with pytest.raises(InvalidArgument) as excinfo:
+            _load_schema_seed(p)
+        return str(excinfo.value)
 
-    junk = tmp_path / "seed.txt"  # arbitrary non-schema text
-    junk.write_text("concepts:\n  BuyerName: bill-to org\n", encoding="utf-8")
-    with pytest.raises(InvalidArgument):
-        _load_schema_seed(junk)
+    # A `key: value` file (YAML, or Form B written as text) would otherwise
+    # load as tags named "concepts_" and "BuyerName__bill-to_org".
+    assert "':'" in _reject("seed.txt", "concepts:\n  BuyerName: bill-to org\n")
+    # Two names that differ only in case/punctuation are one tag, twice.
+    assert "differ only in case" in _reject("dup.txt", "BuyerName\nbuyer_name\n")
+    # A kind outside VALID_KINDS is a typo, not a silent coercion to `inline`.
+    assert "kind" in _reject("k.json", json.dumps({"tags": {"A": {"role": "x", "kind": "field"}}}))
+    # A parent_role naming a tag that does not exist would synthesize a
+    # container outside the vocabulary.
+    assert "parent_role" in _reject(
+        "p.json", json.dumps({"tags": {"A": {"role": "x", "parent_role": "Nope"}}})
+    )
+    # An empty `tags` map, and a JSON array (neither form).
+    assert "no tags" in _reject("e.json", json.dumps({"tags": {}}))
+    assert "array" in _reject("a.json", json.dumps(["A", "B"]))
 
     with pytest.raises(InvalidArgument):
         _load_schema_seed(tmp_path / "missing.json")
