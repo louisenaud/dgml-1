@@ -748,3 +748,26 @@ def test_non_transient_errors_still_raise_immediately(
     with pytest.raises(Exception, match="AuthenticationError"):
         llm._completion_with_retry({"model": "claude-sonnet-4-5"})
     assert len(attempts) == 1
+    
+    
+def test_quiet_stdout_survives_overlapping_threads(capsys: pytest.CaptureFixture[str]) -> None:
+    """Concurrent completion calls must leave sys.stdout as they found it."""
+    import threading
+
+    real_stdout = sys.stdout
+    enter = threading.Barrier(2)
+
+    def worker(release: threading.Event, wait_for: threading.Event) -> None:
+        with llm._quiet_stdout():
+            enter.wait()          # both threads are now inside the redirect
+            release.set()
+            wait_for.wait()       # exit in a staggered order
+
+    a_done, b_done = threading.Event(), threading.Event()
+    ta = threading.Thread(target=worker, args=(a_done, b_done))
+    tb = threading.Thread(target=worker, args=(b_done, a_done))
+    ta.start(); tb.start(); ta.join(); tb.join()
+
+    assert sys.stdout is real_stdout
+    print("payload")
+    assert capsys.readouterr().out == "payload\n"

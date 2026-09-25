@@ -712,8 +712,45 @@ def _build_completion_kwargs(
         if not (forced and is_anthropic_model(config.model)):
             kwargs["reasoning_effort"] = config.reasoning_effort
 
+    # kwargs.update(config.extra)
+    # return kwargs
+    if config.reasoning_effort is not None:
+        forced = _is_tool_choice_forced(tool_choice)
+        if not (forced and is_anthropic_model(config.model)):
+            kwargs["reasoning_effort"] = config.reasoning_effort
+    elif is_anthropic_model(config.model):
+        # Newer Claude models reason by default when no `thinking` param is
+        # sent, and the block comes back encrypted, so litellm reports zero
+        # reasoning tokens while the budget is spent anyway. Measured on a
+        # lease label call, claude-sonnet-5: default = 114s, 16000 tokens,
+        # finish_reason "length" (JSON truncated); thinking disabled = 33s,
+        # 5211 tokens, complete. Callers that want reasoning set
+        # `reasoning_effort` explicitly; everything else runs without it.
+        # `config.extra` still wins below for a per-call override.
+        kwargs["thinking"] = {"type": "disabled"}
+
     kwargs.update(config.extra)
     return kwargs
+
+
+# @contextmanager
+# def _quiet_stdout() -> Iterator[None]:
+#     """Redirect anything written to stdout onto stderr for the duration.
+
+#     Guards the JSON-on-stdout CLI contract against dependencies (LiteLLM in
+#     particular) that ``print`` directly to stdout. ``suppress_debug_info``
+#     silences the known LiteLLM banner; this catches the rest. dgml's own
+#     output is unaffected — ``_emit`` writes the JSON payload after the
+#     completion call returns, outside this block.
+#     """
+#     with redirect_stdout(sys.stderr):
+#         yield
+
+import threading
+
+_quiet_lock = threading.Lock()
+_quiet_depth = 0
+_quiet_saved: Any = None
 
 
 @contextmanager
@@ -721,13 +758,28 @@ def _quiet_stdout() -> Iterator[None]:
     """Redirect anything written to stdout onto stderr for the duration.
 
     Guards the JSON-on-stdout CLI contract against dependencies (LiteLLM in
-    particular) that ``print`` directly to stdout. ``suppress_debug_info``
-    silences the known LiteLLM banner; this catches the rest. dgml's own
-    output is unaffected — ``_emit`` writes the JSON payload after the
-    completion call returns, outside this block.
+    particular) that ``print`` directly to stdout. Reference-counted rather than
+    ``contextlib.redirect_stdout``: that helper swaps the process-global
+    ``sys.stdout`` and restores whatever it saw on entry, so with completion
+    calls running concurrently (``--max-parallel-calls``) a late exiter could
+    "restore" stderr and leave ``sys.stdout`` pointed at stderr for good — the
+    final JSON payload then went to stderr. Here only the first entrant saves
+    the real stream and only the last exiter puts it back.
     """
-    with redirect_stdout(sys.stderr):
+    global _quiet_depth, _quiet_saved
+    with _quiet_lock:
+        if _quiet_depth == 0:
+            _quiet_saved = sys.stdout
+            sys.stdout = sys.stderr
+        _quiet_depth += 1
+    try:
         yield
+    finally:
+        with _quiet_lock:
+            _quiet_depth -= 1
+            if _quiet_depth == 0:
+                sys.stdout = _quiet_saved
+                _quiet_saved = None
 
 
 def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any:
