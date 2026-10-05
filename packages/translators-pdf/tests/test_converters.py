@@ -191,3 +191,71 @@ def test_aspose_cells_license_must_be_non_empty_string() -> None:
 def test_find_soffice_returns_str_or_none() -> None:
     found = _find_soffice()
     assert found is None or isinstance(found, str)
+
+
+def test_xlsx_islands_ignore_a_stray_cell_far_from_the_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One formatted, empty cell at HV65465 stretches the sheet's declared
+    range to 65,465 rows by 230 columns. Island detection must read the
+    handful of cells the sheet has, not allocate the whole rectangle: any
+    call to ``sheet.cell`` is the walk starting, and fails the test, and the
+    cell map must be the same size afterwards."""
+    openpyxl = pytest.importorskip("openpyxl")
+    from translators_pdf import _xlsx_detector
+
+    wb = openpyxl.Workbook()
+    sheet = wb.active
+    sheet["A1"] = "Invoice"
+    sheet["A2"] = "Widget"
+    sheet["B2"] = 42
+    sheet["HV65465"].number_format = "0.00"  # exists, empty, far away
+    assert sheet.max_row == 65465 and sheet.max_column == 230
+    cells_before = len(sheet._cells)
+
+    def _walk_started(*args: object, **kwargs: object) -> None:
+        pytest.fail("find_islands walked the declared range through sheet.cell()")
+
+    monkeypatch.setattr(sheet, "cell", _walk_started)
+    assert _xlsx_detector.find_islands(sheet) == [(1, 1, 2, 2)]
+    assert len(sheet._cells) == cells_before
+
+
+def test_xlsx_islands_fall_back_to_the_walk_for_a_foreign_sheet() -> None:
+    """An object that is not an openpyxl worksheet is walked as before, even
+    when it carries an attribute called ``_cells``; hidden rows and columns
+    are skipped before any cell is read, as before."""
+    from types import SimpleNamespace
+
+    from translators_pdf import _xlsx_detector
+
+    walked: list[tuple[int, int]] = []
+
+    def cell(row: int, column: int) -> SimpleNamespace:
+        walked.append((row, column))
+        return SimpleNamespace(value="x" if (row, column) != (2, 2) else None)
+
+    sheet = SimpleNamespace(
+        max_row=3,
+        max_column=2,
+        row_dimensions={3: SimpleNamespace(hidden=True)},
+        column_dimensions={},
+        _cells={"metadata": object()},
+        cell=cell,
+    )
+    assert _xlsx_detector.find_islands(sheet) == [(1, 1, 2, 2)]
+    assert walked == [(1, 1), (1, 2), (2, 1), (2, 2)]
+
+
+def test_xlsx_islands_still_skip_hidden_rows_and_columns() -> None:
+    openpyxl = pytest.importorskip("openpyxl")
+    from translators_pdf import _xlsx_detector
+
+    wb = openpyxl.Workbook()
+    sheet = wb.active
+    sheet["A1"] = "keep"
+    sheet["A2"] = "hidden row"
+    sheet["C1"] = "hidden col"
+    sheet.row_dimensions[2].hidden = True
+    sheet.column_dimensions["C"].hidden = True
+    assert _xlsx_detector.find_islands(sheet) == [(1, 1, 1, 1)]

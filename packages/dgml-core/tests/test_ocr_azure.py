@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from dgml_core.errors import AuthError, OcrFailed
+from dgml_core.errors import AuthError, MissingExtra, OcrFailed
 from dgml_core.ocr import OcrConfig, OcrProviderName, extract_text_ocr
 from dgml_core.storage import Workspace
 
@@ -137,10 +137,16 @@ def test_azure_literal_api_key_builds_key_credential(monkeypatch: pytest.MonkeyP
     assert getattr(cred, "key", None) == "literal-key-value"
 
 
-def test_azure_missing_sdk_raises_ocr_failed(
+def test_azure_missing_sdk_raises_missing_extra(
     workspace: Workspace, text_pdf: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """If the azure SDK isn't installed, OCR should fail with a helpful message."""
+    """An uninstalled `azure` extra raises :class:`MissingExtra`, naming the extra
+    as a field rather than only in prose.
+
+    It used to raise ``OcrFailed`` — the class for a provider/API failure — which
+    conflated "your credentials or the service are bad" with "this machine never
+    had the SDK". The message is unchanged; what is new is that a caller can read
+    ``exc.extra`` and offer the install instead of regexing the text."""
     # Setting sys.modules[name] = None makes importlib treat the name as unimportable.
     monkeypatch.setitem(sys.modules, "azure.ai.documentintelligence", None)
     monkeypatch.setenv("TEST_AZURE_KEY", "fake-key")
@@ -149,7 +155,7 @@ def test_azure_missing_sdk_raises_ocr_failed(
         endpoint="https://example.cognitiveservices.azure.com/",
         api_key_env="TEST_AZURE_KEY",
     )
-    with pytest.raises(OcrFailed, match="pip install dgml\\[azure\\]"):
+    with pytest.raises(MissingExtra, match="pip install dgml\\[azure\\]") as caught:
         extract_text_ocr(
             text_pdf,
             workspace.root / "page_text",
@@ -158,6 +164,9 @@ def test_azure_missing_sdk_raises_ocr_failed(
             page_images_dir=workspace.root / "page_images",
             config=cfg,
         )
+    assert caught.value.extra == "azure"
+    assert caught.value.distribution == "azure-ai-documentintelligence"
+    assert caught.value.code == "MISSING_EXTRA"
 
 
 def test_azure_extract_writes_per_page_json(

@@ -22,11 +22,15 @@ from dgml_core import layout
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import (
     AuthError,
+    ConversionFailed,
+    FileNotFound,
     GroundedConfigInvalid,
     GroundedConfigMissing,
+    RecordedError,
     SchemaGenerationFailed,
     SchemaNotFound,
     ValuesExtractionFailed,
+    append_recorded_error,
 )
 from dgml_core.extraction_schema import parse_rnc
 from dgml_core.extraction_xml import dgml_xml_to_values
@@ -1053,6 +1057,7 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
     assert set(stats["phases"]["phase3"].keys()) == {
         "duration_s",
         "page_calls",
+        "pages_out_of_range",
         "cost_usd",
         "prompt_tokens",
         "completion_tokens",
@@ -2320,3 +2325,366 @@ def test_phase3_never_cached(workspace: Workspace) -> None:
     assert len(m.call_args_list) >= 2, "phase 3 did not run; test would be vacuous"
     for call in m.call_args_list[1:]:
         assert _cache_control_paths(call.kwargs["messages"]) == []
+
+
+# ---------------------------------------------------------------------------
+# phase 3 and a page the file does not have (dgml-io/dgml#155)
+# ---------------------------------------------------------------------------
+
+
+_TITLE_SUBTITLE_RNC = """\
+namespace dg = "http://dgml.io/ns/dg#"
+namespace docset = "http://www.dgml.io/ws/Test"
+
+start =
+  element dg:chunk {
+    (text | title | subtitle)*
+  }
+
+title =
+  element docset:title {
+    text
+  }
+
+subtitle =
+  element docset:subtitle {
+    text
+  }
+"""
+
+
+def _seed_two_leaves_one_missing_page(
+    workspace: Workspace, fid: str, *, page_count: int
+) -> tuple[str, dict[str, Any]]:
+    """A file with ``page_count`` pages, page 1 seeded, a schema with two
+    fields, and a phase-1 tree with an unmatchable leaf on page 1 and
+    another leaf on page 2."""
+    _seed_file(workspace, fid, page_count=page_count)
+    _seed_page_text(workspace, fid, page=1)  # "Hello", "world"
+    _seed_page_image(workspace, fid, 1)
+    store = DocSetStore(workspace)
+    ds = store.create(name="Test")
+    store.set_schema(ds.id, _TITLE_SUBTITLE_RNC)
+    store.add_file(ds.id, fid)
+    ds_id = ds.id
+    phase1_values = {
+        "title": {"text": "Goodnight", "locations": [{"page_number": 1}]},
+        "subtitle": {"text": "Farewell", "locations": [{"page_number": 2}]},
+    }
+    return ds_id, phase1_values
+
+
+def test_extract_values_phase3_skips_a_page_the_file_does_not_have(workspace: Workspace) -> None:
+    """Phase 1 cited page 2 of a one-page file. Phase 3 still runs for page
+    1 (and patches its leaf), makes no call for page 2, keeps the whole
+    tree with that leaf unmatched, and counts the page in the stats."""
+    fid = "f1aaaaaaaaaa"
+    ds_id, phase1_values = _seed_two_leaves_one_missing_page(workspace, fid, page_count=1)
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[10.0, 20.0, 30.0, 40.0]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    assert mock_completion.call_count == 2  # phase 1, then phase 3 for page 1 only
+    assert result.values["title"]["locations"] == [
+        {"page_number": 1, "bounding_box": [10, 20, 30, 40]}
+    ]
+    assert result.values["subtitle"]["text"] == "Farewell"
+    assert result.values["subtitle"]["locations"] == [{"page_number": 2}]
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["outcome"] == "ok"
+    assert stats["phases"]["phase3"]["page_calls"] == 1
+    assert stats["phases"]["phase3"]["pages_out_of_range"] == 1
+    assert stats["matching"]["matched_phase3"] == 1
+    assert stats["matching"]["unmatched"] == 1
+
+
+def test_extract_values_phase3_makes_no_call_when_every_page_is_missing(
+    workspace: Workspace,
+) -> None:
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid, page_count=1)
+    _seed_page_text(workspace, fid, page=1)
+    _seed_page_image(workspace, fid, 1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    phase1_values = {"title": {"text": "Hello world", "locations": [{"page_number": 3}]}}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": phase1_values}),
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    assert mock_completion.call_count == 1
+    assert result.values["title"]["locations"] == [{"page_number": 3}]
+    # Persisted like any other unresolved leaf: the text is kept, a location
+    # without a box is not written, so it reads back with no locations.
+    xml = workspace.blobs.get_blob(result.xml_key).decode("utf-8")
+    assert dgml_xml_to_values(xml)["title"] == {"text": "Hello world", "locations": []}
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["outcome"] == "ok"
+    assert stats["phases"]["phase3"]["page_calls"] == 0
+    assert stats["phases"]["phase3"]["pages_out_of_range"] == 1
+    assert stats["matching"]["unmatched"] == 1
+
+
+def test_extract_values_phase3_counts_the_dropped_page_even_when_a_page_call_fails(
+    workspace: Workspace,
+) -> None:
+    """The drop happens before any call, so the error stats of a run whose
+    in-range page call then fails still carry the count."""
+    fid = "f1aaaaaaaaaa"
+    ds_id, phase1_values = _seed_two_leaves_one_missing_page(workspace, fid, page_count=1)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            Exception("provider down"),
+        ],
+    ):
+        with pytest.raises(ValuesExtractionFailed, match="phase 3 page 1 call failed"):
+            extract_values(workspace, ds_id, fid, config=config)
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["outcome"] == "error"
+    assert stats["phases"]["phase3"]["pages_out_of_range"] == 1
+
+
+def test_extract_values_phase3_still_calls_a_page_the_file_has(workspace: Workspace) -> None:
+    """The negative case of the guard: on a two-page file, page 2 is inside
+    the range and gets its phase-3 call as before."""
+    fid = "f1aaaaaaaaaa"
+    ds_id, phase1_values = _seed_two_leaves_one_missing_page(workspace, fid, page_count=2)
+    _seed_page_text(workspace, fid, page=2)
+    _seed_page_image(workspace, fid, 2)
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[10.0, 20.0, 30.0, 40.0]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3a"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3b"),
+        ],
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    assert mock_completion.call_count == 3
+    assert result.values["subtitle"]["locations"] == [
+        {"page_number": 2, "bounding_box": [10, 20, 30, 40]}
+    ]
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    assert stats["phases"]["phase3"]["page_calls"] == 2
+    assert stats["phases"]["phase3"]["pages_out_of_range"] == 0
+    assert stats["matching"]["unmatched"] == 0
+
+
+def test_extract_values_phase3_still_calls_a_rendered_page_past_a_stale_page_count(
+    workspace: Workspace,
+) -> None:
+    """A page outside the recorded count that has an image was rendered, so
+    the count is stale, not the page: it keeps its phase-3 call."""
+    fid = "f1aaaaaaaaaa"
+    ds_id, phase1_values = _seed_two_leaves_one_missing_page(workspace, fid, page_count=1)
+    _seed_page_text(workspace, fid, page=2)
+    _seed_page_image(workspace, fid, 2)
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[10.0, 20.0, 30.0, 40.0]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3a"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3b"),
+        ],
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    assert mock_completion.call_count == 3
+    assert result.values["subtitle"]["locations"] == [
+        {"page_number": 2, "bounding_box": [10, 20, 30, 40]}
+    ]
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    assert stats["phases"]["phase3"]["page_calls"] == 2
+    assert stats["phases"]["phase3"]["pages_out_of_range"] == 0
+
+
+@pytest.mark.parametrize("page_count", [0, -1])
+def test_extract_values_phase3_treats_a_non_positive_page_count_as_unknown(
+    workspace: Workspace, page_count: int
+) -> None:
+    """A record whose count is 0 or negative says nothing about the pages,
+    so nothing is dropped: a page with no image keeps the loud failure."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid, page_count=1)
+    _seed_page_text(workspace, fid, page=1)
+    _seed_page_image(workspace, fid, 1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    record = workspace.docs.get_doc("files", fid)
+    assert record is not None
+    workspace.docs.put_doc("files", fid, {**record, "page_count": page_count})
+    phase1_values = {"title": {"text": "Hello world", "locations": [{"page_number": 3}]}}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": phase1_values}),
+    ):
+        with pytest.raises(ValuesExtractionFailed, match=r"no page image .* page 3"):
+            extract_values(workspace, ds_id, fid, config=config)
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["outcome"] == "error"
+    assert stats["phases"]["phase3"]["pages_out_of_range"] == 0
+
+
+def test_extract_values_phase3_still_raises_without_a_page_count(workspace: Workspace) -> None:
+    """The guard needs the file's page count. A record without one keeps
+    today's loud failure for a page that has no image."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid, page_count=1)
+    _seed_page_text(workspace, fid, page=1)
+    _seed_page_image(workspace, fid, 1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    record = workspace.docs.get_doc("files", fid)
+    assert record is not None
+    workspace.docs.put_doc("files", fid, {**record, "page_count": None})
+    phase1_values = {"title": {"text": "Hello world", "locations": [{"page_number": 3}]}}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": phase1_values}),
+    ):
+        with pytest.raises(ValuesExtractionFailed, match="no page image"):
+            extract_values(workspace, ds_id, fid, config=config)
+
+
+def test_extract_values_names_the_conversion_error_when_there_is_no_pdf(
+    workspace: Workspace,
+) -> None:
+    """A legacy .xls is accepted at file add: the record is created, the
+    converter's error is recorded against the file, and no PDF exists. The
+    extraction error repeats that error instead of the bare 'has no source
+    PDF' that used to point at the wrong cause."""
+    fid = "f1aaaaaaaaaa"
+    record = FileRecord(
+        id=fid,
+        original_path="/fake/invoice.xls",
+        original_filename="invoice.xls",
+        sha256="0" * 64,
+        added_at="2026-01-01T00:00:00Z",
+        page_count=None,
+        pdf_converter="xlsx-islands",
+    )
+    workspace.docs.put_doc("files", fid, record.to_json())
+    workspace.blobs.put_blob(layout.file_source_key(fid, "invoice.xls"), b"\xd0\xcf\x11\xe0")
+    append_recorded_error(
+        workspace,
+        fid,
+        RecordedError(
+            operation="convert_to_pdf",
+            message=(
+                "could not open workbook invoice.xls: openpyxl does not support the old "
+                ".xls file format, please use xlrd to read this file, or convert it to the "
+                "more recent .xlsx file format."
+            ),
+            occurred_at="2026-01-01T00:00:00Z",
+            permanent=True,
+        ),
+    )
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with pytest.raises(ConversionFailed) as info:
+        extract_values(workspace, ds_id, fid, config=config)
+    message = str(info.value)
+    assert message.startswith(f"file '{fid}' has no source PDF: converting it failed: ")
+    assert "openpyxl does not support the old .xls file format" in message
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [
+        pytest.param({"errors": None}, id="wrong-shape"),
+        pytest.param(
+            {"errors": [{"operation": "convert_to_pdf", "occurred_at": "2026-01-01T00:00:00Z"}]},
+            id="missing-message",
+        ),
+        pytest.param(
+            {
+                "errors": [
+                    {
+                        "operation": "convert_to_pdf",
+                        "message": None,
+                        "occurred_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            },
+            id="null-message",
+        ),
+    ],
+)
+def test_extract_values_keeps_file_not_found_when_the_errors_document_is_malformed(
+    workspace: Workspace, doc: dict[str, Any]
+) -> None:
+    """The recorded-errors lookup is a diagnostic; a malformed document, or a
+    conversion record without a usable message, must not turn the missing
+    PDF into an internal error or a `CONVERSION_FAILED: ... None`."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid, filename="doc.docx")
+    workspace.docs.put_doc(layout.Collection.ERRORS, fid, doc)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with pytest.raises(FileNotFound, match=f"file '{fid}' has no source PDF$"):
+        extract_values(workspace, ds_id, fid, config=config)
+
+
+def test_extract_values_keeps_the_bare_message_without_a_conversion_error(
+    workspace: Workspace,
+) -> None:
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid, filename="doc.docx")  # a record, a non-PDF source, no PDF
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with pytest.raises(FileNotFound, match=f"file '{fid}' has no source PDF$"):
+        extract_values(workspace, ds_id, fid, config=config)
+
+
+def _recorded(operation: str, message: str, when: str) -> RecordedError:
+    return RecordedError(operation=operation, message=message, occurred_at=when, permanent=True)
+
+
+def test_extract_values_ignores_a_recorded_error_of_another_operation(
+    workspace: Workspace,
+) -> None:
+    """Only a conversion error explains a missing PDF; a page-render error
+    recorded on the file does not change the bare message."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid, filename="doc.docx")
+    append_recorded_error(
+        workspace, fid, _recorded("render_pages", "ghostscript exited 1", "2026-01-01T00:00:00Z")
+    )
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with pytest.raises(FileNotFound, match=f"file '{fid}' has no source PDF$"):
+        extract_values(workspace, ds_id, fid, config=config)
+
+
+def test_extract_values_repeats_the_latest_conversion_error(workspace: Workspace) -> None:
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid, filename="doc.docx")
+    append_recorded_error(
+        workspace, fid, _recorded("convert_to_pdf", "first attempt", "2026-01-01T00:00:00Z")
+    )
+    append_recorded_error(
+        workspace, fid, _recorded("convert_to_pdf", "second attempt", "2026-01-02T00:00:00Z")
+    )
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with pytest.raises(ConversionFailed, match=r"converting it failed: second attempt$"):
+        extract_values(workspace, ds_id, fid, config=config)

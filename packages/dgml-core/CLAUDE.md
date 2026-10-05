@@ -20,6 +20,13 @@ helpers). Anything not exported is internal and may change without notice
 pre-1.0. Consumers `import dgml_core`; `from dgml import …` is intentionally
 unsupported (the CLI package re-exports nothing).
 
+Two entry points look alike and are not: `Workspace.open(...)` resolves a
+workspace **and** brings it up to date (config migration, seal check,
+initialized check, layout migration) and is what anything reading or writing
+a workspace calls; `Workspace.resolve(...)` only answers "which workspace" and
+is for the handful of operations that run before one exists. Creating one is
+`create_workspace(...)`, not a `Workspace` constructor.
+
 ## Optional extras
 
 `aws`, `azure`, `macos`, `pdfium`, `clustering`, and `chain` are declared

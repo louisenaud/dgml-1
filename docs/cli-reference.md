@@ -1345,7 +1345,10 @@ payloads. Chunking is strictly that escalation: an ordinary run is never
 offered the continuation tool or the `done` flag, so it can't split output
 that fits in one call. `extraction_stats.json` records both under
 `phases.phase1`: `chunk_calls` (1 = ordinary single submission) and
-`truncated_retries`.
+`truncated_retries`. `phases.phase3.pages_out_of_range` counts the pages
+phase 1 cited that the file does not have (outside `1..page_count`, with no
+page image): their items make no phase-3 call and stay unmatched, like any
+other leaf phase 3 could not resolve, and the run still writes the tree.
 
 **Schema-declared invariants.** A field may carry a `## Invariant:` annotation
 naming a checkable relation against the rest of the submission — the
@@ -1392,7 +1395,9 @@ inlined schema, e.g. Gemini's "too many states for serving").
 
 Errors across the group: `DOCSET_NOT_FOUND`, `FILE_NOT_FOUND`,
 `SCHEMA_NOT_FOUND`, `SCHEMA_INVALID`, `GUIDANCE_NOT_FOUND`, `NO_FILES`,
-`VALUES_NOT_FOUND`, `GROUNDED_CONFIG_MISSING`, `GROUNDED_CONFIG_INVALID`.
+`VALUES_NOT_FOUND`, `GROUNDED_CONFIG_MISSING`, `GROUNDED_CONFIG_INVALID`,
+and `CONVERSION_FAILED` when the file has no PDF because its conversion
+failed at `file add` (the message repeats the converter's error).
 
 ## File commands
 
@@ -2361,7 +2366,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `INVALID_PDF` | hard | File does not start with the `%PDF-` magic. |
 | `CONFLICT` | hard | Hash- or path-conflict under `--on-conflict error`; `file add --id <id>` naming an id another File already holds; or `workspace create --id <id>` naming an id the store of workspaces already holds. |
 | `CONVERSION_CONFIG_INVALID` | hard | The `conversion` config section is malformed. |
-| `CONVERSION_FAILED` | hard / soft | A docx/xlsx→PDF conversion failed (soft as `conversion_error` on a bulk add entry). |
+| `CONVERSION_FAILED` | hard / soft | A docx/xlsx→PDF conversion failed (soft as `conversion_error` on a bulk add entry); also raised by `extraction generate-schema` and `extraction extract` for a file that has no PDF because its conversion failed. |
 | `OCR_CONFIG_MISSING` | hard | `--text-mode ocr`/`hybrid` with no `ocr` config section. |
 | `OCR_CONFIG_INVALID` | hard | The `ocr` config section has invalid fields. |
 | `OCR_FAILED` | soft | Provider API failure during `--text-mode ocr`/`hybrid`; recorded on the File (`text_extraction_error`). |
@@ -2381,6 +2386,8 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `SCHEMA_INVALID` | hard | A schema passed to `extraction set-schema` is not valid RNC (within the supported subset) or not a JSON object. |
 | `NO_FILES` | hard | `extraction generate-schema` has no sample files (empty DocSet and no `--from-file`). |
 | `VALUES_NOT_FOUND` | hard | `extraction get-values` ran before `extraction extract` for that file. |
+| `GENERATION_CONFIG_MISSING` | hard | A generation model can't be resolved — neither the per-task field (`generation.model` / `generation.label_model`) nor its `[models]` tier (`standard` / `advanced`) is set in the merged config. |
+| `GENERATION_CONFIG_INVALID` | hard | The `generation` config section has a missing/invalid field. |
 | `GROUNDED_CONFIG_MISSING` | hard | An `extraction` command needs a `grounded` config section that is absent. |
 | `GROUNDED_CONFIG_INVALID` | hard | The `grounded` config section has a missing/invalid field. |
 | `SCHEMA_GENERATION_FAILED` | hard | The schema-generation LLM call failed or returned a non-object. |
@@ -2390,7 +2397,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `CHAIN_TX_REVERTED` | hard | A broadcast `stake`/`registry create` transaction reverted on-chain. |
 | `WALLET_KEY_MISSING` | hard | No signing key in the OS keyring, or it doesn't control `--from`. |
 | `RECORD_NOT_FOUND` | hard | `prove` could not find the anchored record (bad checksum/registry). |
-| `MANIFEST_INVALID` | hard | A `dgmlx verify` bundle is structurally broken (missing/duplicate page number, absent artifact). |
+| `ATTESTATION_INVALID` | hard | A `dgmlx verify` bundle or an `attestation.xml` is structurally broken — missing/duplicate page number, absent artifact, not well-formed XML, or missing a required attribute. |
 | `ENGINE_NOT_AVAILABLE` | soft | The configured PDF engine cannot run (e.g. `pypdfium2` without the `pdfium` extra installed); recorded as a page-render failure, or a per-file `failed` entry when it was slicing. |
 | `GHOSTSCRIPT_NOT_FOUND` | soft | The ghostscript binary (`gs`, or `gswin64c`/`gswin32c` on Windows) is not on `PATH` (an `ENGINE_NOT_AVAILABLE` subtype); recorded as a page-render failure. |
 | `PAGE_RENDER_FAILED` | soft | The page renderer failed to render a page; recorded on the File (`page_render_error`). |
@@ -2404,7 +2411,13 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `WORKSPACE_NOT_FOUND` | hard | `--workspace <id>` named something the store of workspaces does not hold and that is not an existing directory either. Deliberately an error rather than falling through to path resolution: with both places looked in and neither answering, the likeliest explanation is a typo'd id, and resolving to a path would turn that typo into a new directory. |
 | `WORKSPACES_WRITE_CONFLICT` | hard | Another writer changed this workspace's `config.toml` since it was read. A config is written whole, so overwriting would discard whatever that writer changed; re-run the command to work from the current config. Only backends that make writes conditional on the stored text (Mongo) can report this; the local-dir store has one writer per machine and does not. |
 | `STORAGE_BACKEND_MISMATCH` | hard | The `[storage]` configuration a workspace resolves no longer matches the `storage_fingerprint` sealed in its `config.toml` — its data is on the previously sealed backend. Accept the change with `dgml workspace reseal <root>`, or restore the `[storage]` table. |
-| `NOT_IMPLEMENTED` | hard | A requested mode/path is not implemented. |
+| `WORKSPACES_UNAVAILABLE` | hard | The store of workspaces could not be reached — it is what *finds* a workspace, so this fails every command, not just the one that touches the backing store. The message names the host, port and driver error. |
+| `WORKSPACE_MIGRATION_FAILED` | hard | An automatic in-place workspace upgrade could not complete; the workspace is left as it was, and the message names the migration that stopped. |
+| `EMPTY_MODEL_RESPONSE` | hard | An LLM call returned no content at all (as distinct from content that failed to parse). |
+| `INCREMENTAL_WITHOUT_CLUSTERS` | hard | `cluster --skip-existing` in a workspace that has no existing clusters to build on. |
+| `LINK_PLAN_FAILED` | soft | The semantic-link pass failed for a document during `docset generate`; the document still converts, unlinked. |
+| `GUIDANCE_NOT_FOUND` | hard | An `extraction` command needs DocSet guidance that has not been set. |
+| `REGISTRY_NOT_FOUND` | hard | A named on-chain registry does not exist (`stake`, `prove`). |
 | `DGML_ERROR` | hard | Generic base code; specific codes above are preferred. |
 
 Codes that read as soft above are the same identifiers, just delivered in a

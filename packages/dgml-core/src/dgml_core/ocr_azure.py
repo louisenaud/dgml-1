@@ -24,7 +24,7 @@ import os
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from .errors import AuthError, OcrConfigInvalid, OcrFailed
+from .errors import AuthError, MissingExtra, OcrConfigInvalid, OcrFailed
 from .ocr import OcrConfig, OcrPageResult, OcrProvider, OcrProviderName
 from .text_extraction import split_word_into_tokens
 
@@ -71,9 +71,11 @@ class AzureProvider(OcrProvider):
         try:
             from azure.ai.documentintelligence import DocumentIntelligenceClient
         except ImportError as exc:
-            raise OcrFailed(
+            raise MissingExtra(
                 "azure-ai-documentintelligence is required for Azure OCR. "
-                "Install with `pip install dgml[azure]`."
+                "Install with `pip install dgml[azure]`.",
+                extra="azure",
+                distribution="azure-ai-documentintelligence",
             ) from exc
 
         assert config.endpoint is not None  # validated by load_ocr_config
@@ -162,18 +164,22 @@ def _azure_credential(config: OcrConfig) -> AzureKeyCredential | TokenCredential
         try:
             from azure.core.credentials import AzureKeyCredential
         except ImportError as exc:
-            raise OcrFailed(
+            raise MissingExtra(
                 "azure-ai-documentintelligence is required for Azure OCR. "
-                "Install with `pip install dgml[azure]`."
+                "Install with `pip install dgml[azure]`.",
+                extra="azure",
+                distribution="azure-ai-documentintelligence",
             ) from exc
         return AzureKeyCredential(key)
 
     try:
         from azure.identity import DefaultAzureCredential
     except ImportError as exc:
-        raise OcrFailed(
+        raise MissingExtra(
             "azure-identity is required for token-based Azure OCR. "
-            "Install with `pip install dgml[azure]`."
+            "Install with `pip install dgml[azure]`.",
+            extra="azure",
+            distribution="azure-identity",
         ) from exc
     return DefaultAzureCredential()
 

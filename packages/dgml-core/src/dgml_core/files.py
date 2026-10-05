@@ -28,6 +28,7 @@ from .conversion import (
     load_conversion_config,
 )
 from .errors import (
+    CONVERT_TO_PDF_OPERATION,
     AuthError,
     ConflictError,
     DgmlError,
@@ -35,6 +36,7 @@ from .errors import (
     FileNotFound,
     InvalidArgument,
     InvalidPDF,
+    MissingExtra,
     OcrFailed,
     PageRenderFailed,
     RecordedError,
@@ -478,7 +480,7 @@ class FileStore:
                     self.ws,
                     file_id,
                     RecordedError(
-                        operation="convert_to_pdf",
+                        operation=CONVERT_TO_PDF_OPERATION,
                         message=message,
                         occurred_at=now_iso(),
                         permanent=True,
@@ -634,7 +636,11 @@ class FileStore:
                     page_images_dir=pages_dir,
                     config=config,
                 )
-        except (OcrFailed, AuthError) as exc:
+        # MissingExtra joins these deliberately: an uninstalled `azure`/`aws` extra
+        # is the same shape of problem as a bad credential — permanent until the
+        # environment is fixed, and no reason to fail the whole add. Without it here
+        # the File would not land at all.
+        except (OcrFailed, AuthError, MissingExtra) as exc:
             # Provider/auth failures are recorded as permanent — re-running
             # without changing config or credentials won't help. `dgml check
             # --retry-errors` is the recovery path once the user fixes them.
@@ -683,7 +689,7 @@ class FileStore:
                     verbose=verbose,
                     debug=debug,
                 )
-        except (OcrFailed, AuthError) as exc:
+        except (OcrFailed, AuthError, MissingExtra) as exc:
             return self._record_text_failure(file_id, str(exc), permanent=True), None
 
         return self._classify_and_record(result, file_id, page_count, mode_label="hybrid")

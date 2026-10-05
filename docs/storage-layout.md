@@ -19,8 +19,10 @@ element can span pages.
 
 The root is determined in this order:
 
-1. `--workspace <path-or-id>` CLI flag (or `Workspace.resolve(<path-or-id>)` in
-   code). The argument is a filesystem path **or** a workspace id. Since an id needs no
+1. `--workspace <path-or-id>` CLI flag (or, in code, `Workspace.open(<path-or-id>)` —
+   which resolves *and* migrates, seal-checks and requires an initialized workspace;
+   `Workspace.resolve` does only the first step and is for the commands that run before a
+   workspace exists). The argument is a filesystem path **or** a workspace id. Since an id needs no
    distinguishing prefix (`my-workspace` is as valid as a generated `ws_qf7imkc7f6oqzfwt`)
    it is also a legal directory name, so the two are told apart in four steps:
 
@@ -46,7 +48,7 @@ The root is determined in this order:
    [the store of workspaces](#the-store-of-workspaces) instead. Item 3 is what keeps a
    workspace made by an older dgml — or by `create <path>` — opening with no arguments.
 
-`dgml workspace create --organization <org>` (or `Workspace.init()` in code)
+`dgml workspace create --organization <org>` (or `create_workspace(organization=…)` in code)
 creates the directory layout for a fresh workspace and records its identity in
 `workspace.json`. Where it creates it depends on whether you name a place: a path (or
 `--workspace` / `$DGML_HOME` pointing at one) makes a workspace in that directory,

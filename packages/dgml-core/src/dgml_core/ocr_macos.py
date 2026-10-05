@@ -38,7 +38,7 @@ import sys
 from collections.abc import Iterator
 from typing import Any, ClassVar
 
-from .errors import OcrFailed
+from .errors import MissingExtra, OcrFailed
 from .ocr import OcrConfig, OcrProvider, OcrProviderName
 from .text_extraction import split_word_into_tokens
 
@@ -63,9 +63,11 @@ class MacosProvider(OcrProvider):
             import Foundation
             import Vision
         except ImportError as exc:
-            raise OcrFailed(
+            raise MissingExtra(
                 "PyObjC Vision bindings are required for macOS OCR. "
-                "Install with `pip install dgml[macos]`."
+                "Install with `pip install dgml[macos]`.",
+                extra="macos",
+                distribution="pyobjc-framework-Vision",
             ) from exc
         # Annotated as Any so the attribute type never depends on resolving the
         # pyobjc modules — they're absent off-macOS (excluded by the `; darwin`
