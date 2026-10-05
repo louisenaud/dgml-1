@@ -43,29 +43,24 @@ _RETRY_BACKOFF_S = 1.0
 
 
 class AzureProvider(OcrProvider):
-    name: ClassVar[OcrProviderName] = OcrProviderName.AZURE
+    name: ClassVar[str] = OcrProviderName.AZURE.value
     config_fields: ClassVar[frozenset[str]] = frozenset({"endpoint", "api_key", "api_key_env"})
 
     @classmethod
-    def parse_config(cls, section: dict[str, Any]) -> OcrConfig:
-        cls._check_no_extra_fields(section)
-        endpoint = section.get("endpoint")
+    def parse_config(cls, config: OcrConfig) -> OcrConfig:
+        cls._check_no_extra_fields(config.options)
+        endpoint = config.options.get("endpoint")
         if not isinstance(endpoint, str) or not endpoint.strip():
             raise OcrConfigInvalid("Azure OCR requires non-empty 'ocr.endpoint'")
-        api_key = section.get("api_key")
+        api_key = config.options.get("api_key")
         if api_key is not None and (not isinstance(api_key, str) or not api_key):
             raise OcrConfigInvalid("'ocr.api_key' must be a non-empty string if set")
-        api_key_env = section.get("api_key_env")
+        api_key_env = config.options.get("api_key_env")
         if api_key_env is not None and (not isinstance(api_key_env, str) or not api_key_env):
             raise OcrConfigInvalid("'ocr.api_key_env' must be a non-empty env var name if set")
         if api_key is not None and api_key_env is not None:
             raise OcrConfigInvalid("set at most one of 'ocr.api_key' / 'ocr.api_key_env', not both")
-        return OcrConfig(
-            provider=cls.name,
-            endpoint=endpoint,
-            api_key=api_key,
-            api_key_env=api_key_env,
-        )
+        return config
 
     def __init__(self, config: OcrConfig) -> None:
         try:
@@ -78,13 +73,14 @@ class AzureProvider(OcrProvider):
                 distribution="azure-ai-documentintelligence",
             ) from exc
 
-        assert config.endpoint is not None  # validated by load_ocr_config
+        endpoint = config.options.get("endpoint")
+        assert isinstance(endpoint, str)  # validated by parse_config
         # connection_timeout / read_timeout bound each HTTP request (the read
         # timeout is what turns a wedged connection into a prompt error instead
         # of an indefinite hang); retry_* let azure-core auto-retry transient
         # failures. All are standard azure-core client kwargs.
         self._client = DocumentIntelligenceClient(
-            config.endpoint,
+            endpoint,
             _azure_credential(config),
             connection_timeout=_CONNECT_TIMEOUT_S,
             read_timeout=_READ_TIMEOUT_S,
@@ -152,12 +148,14 @@ def _azure_credential(config: OcrConfig) -> AzureKeyCredential | TokenCredential
     > token chain (``DefaultAzureCredential``). Mutual exclusion of the
     two key fields is enforced upstream in :meth:`AzureProvider.parse_config`.
     """
-    key: str | None = config.api_key
-    if key is None and config.api_key_env:
-        key = os.environ.get(config.api_key_env)
+    api_key = config.options.get("api_key")
+    api_key_env = config.options.get("api_key_env")
+    key: str | None = api_key if isinstance(api_key, str) else None
+    if key is None and api_key_env:
+        key = os.environ.get(str(api_key_env))
         if not key:
             raise AuthError(
-                f"environment variable ${config.api_key_env} is not set "
+                f"environment variable ${api_key_env} is not set "
                 "(referenced by ocr.api_key_env in config.toml)"
             )
     if key is not None:

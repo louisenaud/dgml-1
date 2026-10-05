@@ -108,14 +108,14 @@ def _entity_ids(ws: Workspace, collection: str, blob_prefix: str) -> list[str]:
 
 
 def check_workspace(
-    ws: Workspace, *, retry_errors: bool = False, verbose: bool = False, debug: bool = False
+    ws: Workspace, *, retry_errors: bool = False, debug: bool = False
 ) -> CheckReport:
     """Validate the workspace; repair fixable issues where safe.
 
     With ``retry_errors=True``, recorded permanent errors are cleared before
     checking so that previously-failed operations are re-attempted.
-    ``verbose`` is forwarded to hybrid re-extraction (the only path that
-    currently produces optional stderr diagnostics). ``debug`` is likewise
+    Hybrid re-extraction logs its per-page diagnostics through
+    ``dgml_core.hybrid`` (see :mod:`dgml_core.hybrid`). ``debug`` is
     forwarded so a hybrid LLM merge during re-extraction records its usage
     telemetry (only the hybrid path issues LLM calls).
     """
@@ -127,7 +127,6 @@ def check_workspace(
             ws,
             file_id,
             retry_errors=retry_errors,
-            verbose=verbose,
             debug=debug,
             report=report,
         )
@@ -144,7 +143,6 @@ def _check_file(
     file_id: str,
     *,
     retry_errors: bool,
-    verbose: bool,
     debug: bool,
     report: CheckReport,
 ) -> None:
@@ -294,7 +292,6 @@ def _check_file(
             file_id=file_id,
             text_mode=text_mode,
             dpi=dpi,
-            verbose=verbose,
             debug=debug,
             report=report,
         )
@@ -515,7 +512,6 @@ def _check_text_extraction(
     file_id: str,
     text_mode: str,
     dpi: int,
-    verbose: bool,
     debug: bool,
     report: CheckReport,
 ) -> None:
@@ -553,9 +549,7 @@ def _check_text_extraction(
         return
 
     try:
-        result = _reextract(
-            ws, source_key, file_id, text_mode, dpi=dpi, verbose=verbose, debug=debug
-        )
+        result = _reextract(ws, source_key, file_id, text_mode, dpi=dpi, debug=debug)
     except (TextExtractionFailed, OcrFailed, AuthError, DgmlError) as exc:
         append_recorded_error(
             ws,
@@ -619,7 +613,6 @@ def _reextract(
     text_mode: str,
     *,
     dpi: int = DEFAULT_DPI,
-    verbose: bool = False,
     debug: bool = False,
 ) -> ExtractDigitalResult:
     """Re-extract text for ``file_id`` using whichever mode it was added with.
@@ -662,7 +655,6 @@ def _reextract(
                     text_extraction_config=text_extraction_config,
                     workspace=ws,
                     dpi=dpi,
-                    verbose=verbose,
                     debug=debug,
                 )
         return extract_text_digital(pdf_path, text_dir, file_id=file_id, dpi=dpi)

@@ -16,6 +16,7 @@ deterministic capture of style facts during digital extraction."""
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -320,7 +321,7 @@ def test_load_style_config_absent_returns_none(tmp_path: Path) -> None:
 
 
 def test_load_style_config_requires_enabled(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """`enabled = true` is the switch — a configured-but-unenabled section is off.
 
@@ -339,9 +340,9 @@ def test_load_style_config_requires_enabled(
     for section in sections:
         config = {"style": section}
         models_config._WARNED_DISABLED.clear()
-        capsys.readouterr()
+        caplog.clear()
         assert load_style_config(_ws_with_config(tmp_path, config)) is None
-        warned = "not enabled" in capsys.readouterr().err
+        warned = "not enabled" in caplog.text
         # Only a section carrying real configuration is worth warning about;
         # `enabled = false` alone is the shipped default and says nothing.
         assert warned is (set(section) - {"enabled"} != set())
@@ -796,9 +797,10 @@ def test_annotate_style_isolates_per_page_failure(tmp_path: Path, monkeypatch) -
     assert styles == ["font-weight: bold", None, "font-weight: bold", "font-weight: bold"]
 
 
-def test_annotate_style_reports_failures_under_debug(tmp_path: Path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
-    """Failed pages are named on stderr under debug, and an unreachable model
-    is summarized once rather than once per page."""
+def test_annotate_style_reports_failures(tmp_path: Path, monkeypatch, caplog) -> None:  # type: ignore[no-untyped-def]
+    """Failed pages are logged (INFO) one line each, and an unreachable model is
+    summarized once, at WARNING — no ``debug`` needed: it leaves the whole
+    document unstyled, which the user has to hear about."""
     import litellm
     from dgml_core import style_llm
 
@@ -815,17 +817,22 @@ def test_annotate_style_reports_failures_under_debug(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr(style_llm, "_request_styles", fake_request)
 
-    assert _annotate(ws, file_id, root, debug=True) == 0
+    caplog.set_level(logging.INFO, logger="dgml_core.style_llm")
+    assert _annotate(ws, file_id, root) == 0
 
-    err = capsys.readouterr().err
-    assert "style: page 1: RuntimeError: boom on one" in err
-    assert "style: page 2: AuthenticationError" in err
-    assert err.count("model unreachable") == 1
-    assert "3/3 pages failed" in err
+    info = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert "style: page 1: RuntimeError: boom on one" in info
+    assert any(m.startswith("style: page 2: AuthenticationError") for m in info)
+    assert len(warned) == 1
+    assert "model unreachable" in warned[0]
+    assert "3/3 pages failed" in warned[0]
 
 
-def test_annotate_style_reports_nothing_without_debug(tmp_path: Path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
-    """Failure reporting is debug-gated — the default path stays silent."""
+def test_annotate_style_page_failures_are_not_warnings(tmp_path: Path, monkeypatch, caplog) -> None:  # type: ignore[no-untyped-def]
+    """An ordinary per-page failure is INFO (``dgml --verbose``), never WARNING —
+    the default CLI stays quiet about one bad page; and nothing reaches stderr
+    when the caller configured no logging."""
     from dgml_core import style_llm
 
     ws, file_id, root = _multipage_style_tree(tmp_path, 2)
@@ -835,8 +842,9 @@ def test_annotate_style_reports_nothing_without_debug(tmp_path: Path, monkeypatc
 
     monkeypatch.setattr(style_llm, "_request_styles", fake_request)
 
+    caplog.set_level(logging.INFO, logger="dgml_core.style_llm")
     assert _annotate(ws, file_id, root) == 0
-    assert capsys.readouterr().err == ""
+    assert [r.levelno for r in caplog.records] == [logging.INFO, logging.INFO]
 
 
 @pytest.mark.parametrize("workers", [1, 2, 3, 8])

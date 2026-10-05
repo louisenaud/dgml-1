@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 import os
 import sys
 from dataclasses import dataclass
@@ -31,6 +32,8 @@ if TYPE_CHECKING:
     from .storage_service import BlobStore, DocStore, StorageConfig
 
 from .default_config import PROVIDER_MODELS
+
+logger = logging.getLogger(__name__)
 
 ENV_VAR = "DGML_HOME"
 DEFAULT_DIR_NAME = "dgml-workspace"
@@ -124,8 +127,13 @@ class Workspace:
         3. ``is_initialized()`` — which *is* "has a config".
         4. ``migrate_workspace`` — upgrades the layout; a no-op read when current.
 
-        ``on_migration`` fires per migration that **changed** something, with the
-        workspace it changed. Ignoring it is a reasonable default.
+        Each migration that **changed** something is logged at INFO (a
+        human-readable notice) and, when given, passed to ``on_migration`` with
+        the workspace it changed — the structured hook, for a caller that wants
+        to record the upgrade rather than read about it. Ignoring it is a
+        reasonable default. A migration that changed nothing says nothing:
+        bumping the version stamp on a workspace with no work to do is
+        bookkeeping, not an upgrade.
         """
         # Imported here, not at module scope: both modules import this one.
         from .errors import WorkspaceNotInitialized
@@ -147,7 +155,10 @@ class Workspace:
                 workspace=ws,
             )
         for result in migrate_workspace(ws):
-            if result.changed and on_migration is not None:
+            if not result.changed:
+                continue
+            logger.info("[dgml] upgraded workspace at %s — %s", ws.root, result.summary())
+            if on_migration is not None:
                 on_migration(ws, result)
         return ws
 
@@ -495,15 +506,23 @@ def write_json_atomic(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    tmp.write_text(text, encoding="utf-8")
+    # newline="" for the same reason as write_text_atomic: every atomic writer puts
+    # down the text's own line endings on every platform.
+    tmp.write_text(text, encoding="utf-8", newline="")
     tmp.replace(path)
 
 
 def write_text_atomic(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` via write-then-rename (e.g. ``extraction-schema.rnc``)."""
+    """Write ``text`` to ``path`` via write-then-rename (e.g. ``extraction-schema.rnc``).
+
+    ``newline=""`` writes the text's own line endings. Without it, Windows
+    text mode turns every newline into carriage return plus newline, and a
+    config read with ``newline=""`` (which keeps a CRLF file's endings) came
+    back with a doubled carriage return that the TOML parser refused.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
+    tmp.write_text(text, encoding="utf-8", newline="")
     tmp.replace(path)
 
 
@@ -623,7 +642,7 @@ def canonical_provider(provider: str) -> str:
 def detect_provider(environ: dict[str, str]) -> str | None:
     """Auto-detect a provider from non-empty API-key env vars (no live check).
 
-    Both Anthropic + Gemini → ``mixed`` (the curated Gemini-light /
+    Both Anthropic + Gemini → ``anthropic_google`` (the curated Gemini-light /
     Anthropic-pipeline blend, which needs both keys); Anthropic only →
     ``anthropic``; Gemini only → ``google``; OpenAI only → ``openai``; none →
     ``None``.
@@ -638,7 +657,7 @@ def detect_provider(environ: dict[str, str]) -> str | None:
 
     anthropic, gemini = has("ANTHROPIC_API_KEY"), has("GEMINI_API_KEY")
     if anthropic and gemini:
-        return "mixed"
+        return "anthropic_google"
     if anthropic:
         return "anthropic"
     if gemini:
@@ -658,30 +677,28 @@ def render_config_toml(provider: str | None) -> str:
 
     ``provider`` names a :data:`PROVIDER_MODELS` key (aliases already resolved),
     or ``None`` to emit a commented-out ``[models]`` placeholder (no keys
-    detected). The ``[models]`` block carries no tier→capability comments — that
-    mapping is documented in the CLI reference and may change without rewriting
-    a user's file."""
+    detected). The ``[models]`` block names only the family — the expanded tiers
+    are reported on stderr by ``dgml init``, never written, so the config tracks
+    dgml's defaults across upgrades."""
+    choices = "|".join(sorted(PROVIDER_MODELS))
     if provider is None:
         checked = ", ".join(API_KEY_ENV_VARS)
         return (
             f"# No API key detected (checked {checked}).\n"
             "# Set at least one key, then rerun:\n"
-            "#   dgml init --provider <anthropic|google|mixed|openai>\n"
+            f"#   dgml init --provider <{choices}>\n"
             "#\n"
             "# [models]\n"
-            '# light    = "..."\n'
-            '# standard = "..."\n'
-            '# advanced = "..."\n'
-            '# expert   = "..."\n'
+            f'# family = "<{choices}>"\n'
             "\n" + _OCR_GUIDANCE + "\n" + _PDF_GUIDANCE + "\n" + _FEATURE_GUIDANCE
         )
-    tiers = PROVIDER_MODELS[provider]
-    width = max(len(t) for t in tiers)
-    lines = ["[models]"]
-    for tier in ("light", "standard", "advanced", "expert"):
-        lines.append(f'{tier.ljust(width)} = "{tiers[tier]}"')
     return (
-        "\n".join(lines) + "\n\n" + _OCR_GUIDANCE + "\n" + _PDF_GUIDANCE + "\n" + _FEATURE_GUIDANCE
+        "[models]\n"
+        "# One key picks a whole provider family's model defaults. Override any\n"
+        "# single tier by adding it here (light/standard/advanced/expert); the\n"
+        "# tier->task mapping and per-task overrides are in the CLI reference.\n"
+        f'family = "{provider}"\n'
+        "\n" + _OCR_GUIDANCE + "\n" + _PDF_GUIDANCE + "\n" + _FEATURE_GUIDANCE
     )
 
 
@@ -699,7 +716,7 @@ def write_user_config(provider: str | None, *, overwrite: bool) -> tuple[bool, P
     backup: Path | None = None
     if path.exists():
         backup = path.with_suffix(path.suffix + ".bak")
-        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        backup.write_bytes(path.read_bytes())  # the same bytes, newlines included
     resolved = canonical_provider(provider) if provider is not None else None
     path.parent.mkdir(parents=True, exist_ok=True)
     write_text_atomic(path, render_config_toml(resolved))

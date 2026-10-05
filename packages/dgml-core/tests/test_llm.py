@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import logging
 import sys
+import threading
 from typing import Any
 
 import litellm
@@ -37,9 +39,14 @@ def test_litellm_debug_banner_suppressed() -> None:
 
 
 def test_completion_with_retry_keeps_stdout_clean(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Anything a completion writes to stdout is redirected to stderr."""
+    """Anything a completion writes to stdout becomes a WARNING record on
+    ``dgml_core.llm`` — stdout stays clean for the JSON payload, and nothing
+    reaches a real stream unless the caller routes it (the CLI shows WARNINGs
+    by default)."""
 
     def chatty_completion(**kwargs: Any) -> dict[str, Any]:
         print("LiteLLM noise on stdout")  # simulating the chatty dependency
@@ -47,12 +54,112 @@ def test_completion_with_retry_keeps_stdout_clean(
 
     monkeypatch.setattr("litellm.completion", chatty_completion)
 
-    result = llm._completion_with_retry({"model": "gpt-4o", "messages": []})
+    with caplog.at_level(logging.WARNING, logger="dgml_core.llm"):
+        result = llm._completion_with_retry({"model": "gpt-4o", "messages": []})
 
     assert result == _resp("OK")
     captured = capsys.readouterr()
     assert captured.out == ""  # stdout stays clean for the JSON payload
-    assert "LiteLLM noise on stdout" in captured.err
+    assert captured.err == ""  # no logging configured -> no stream output
+    warned = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("LiteLLM noise on stdout" in r.getMessage() for r in warned)
+
+
+def test_quiet_stdout_non_lifo_exits_restore_stdout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Overlapping guards exiting out of order still restore the real stdout.
+
+    LLM calls run in thread pools (grounded phase 3, parallel transcription,
+    style page workers) and ``sys.stdout`` is process-global. The guard is
+    refcounted — first in saves the real stdout, last out restores it — where
+    a naive per-call ``redirect_stdout`` would re-install a dead sink on the
+    second exit and swallow every later print for the rest of the process."""
+    real = sys.stdout
+    a_in, b_in, a_out = threading.Event(), threading.Event(), threading.Event()
+
+    def thread_a() -> None:
+        with llm._quiet_stdout():
+            a_in.set()
+            assert b_in.wait(5)
+            print("captured while both guards active")
+        a_out.set()  # A exits FIRST — non-LIFO
+
+    def thread_b() -> None:
+        assert a_in.wait(5)
+        with llm._quiet_stdout():
+            b_in.set()
+            assert a_out.wait(5)
+
+    with caplog.at_level(logging.WARNING, logger="dgml_core.llm"):
+        ta, tb = threading.Thread(target=thread_a), threading.Thread(target=thread_b)
+        ta.start()
+        tb.start()
+        ta.join(10)
+        tb.join(10)
+
+    assert sys.stdout is real  # the whole point: not a stale sink
+    assert any("captured while both guards active" in r.getMessage() for r in caplog.records)
+
+
+def test_quiet_stdout_survives_a_handler_that_writes_to_stdout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Pathological embedder config: a handler that resolves ``sys.stdout`` at
+    emit time writes INTO the sink while the sink is logging. The sink's lock
+    is a leaf lock (released before emitting) and lines carrying the capture
+    marker are dropped on any thread, so this must neither deadlock nor echo
+    unboundedly — and the original stray line is still recorded exactly once."""
+
+    class _StdoutAtEmit(logging.StreamHandler):  # type: ignore[type-arg]
+        @property
+        def stream(self) -> Any:
+            return sys.stdout
+
+        @stream.setter
+        def stream(self, _value: Any) -> None:
+            pass
+
+    log = logging.getLogger("dgml_core.llm")
+    handler = _StdoutAtEmit()
+    handler.setLevel(logging.WARNING)
+    log.addHandler(handler)
+    done = threading.Event()
+
+    def scenario() -> None:
+        with llm._quiet_stdout():
+            print("stray line")
+        done.set()
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="dgml_core.llm"):
+            worker = threading.Thread(target=scenario, daemon=True)
+            worker.start()
+            assert done.wait(10), "deadlock: sink lock held while a handler wrote back into it"
+            worker.join(10)
+    finally:
+        log.removeHandler(handler)
+
+    hits = [r for r in caplog.records if "stray line" in r.getMessage()]
+    assert len(hits) == 1  # the real line once; the handler's echo dropped
+
+
+def test_stray_stdout_partial_line_is_flushed_as_a_record(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A write with no trailing newline still surfaces: the sink flushes its
+    buffer when the guarded call exits, so nothing a dependency wrote is lost."""
+
+    def chatty_completion(**kwargs: Any) -> dict[str, Any]:
+        sys.stdout.write("partial line, no newline")
+        return _resp("OK")
+
+    monkeypatch.setattr("litellm.completion", chatty_completion)
+
+    with caplog.at_level(logging.WARNING, logger="dgml_core.llm"):
+        llm._completion_with_retry({"model": "gpt-4o", "messages": []})
+
+    assert any("partial line, no newline" in r.getMessage() for r in caplog.records)
 
 
 def test_completion_with_retry_redirects_only_during_call(
@@ -748,8 +855,6 @@ def test_non_transient_errors_still_raise_immediately(
     with pytest.raises(Exception, match="AuthenticationError"):
         llm._completion_with_retry({"model": "claude-sonnet-4-5"})
     assert len(attempts) == 1
-    
-    
 def test_quiet_stdout_survives_overlapping_threads(capsys: pytest.CaptureFixture[str]) -> None:
     """Concurrent completion calls must leave sys.stdout as they found it."""
     import threading
@@ -759,9 +864,9 @@ def test_quiet_stdout_survives_overlapping_threads(capsys: pytest.CaptureFixture
 
     def worker(release: threading.Event, wait_for: threading.Event) -> None:
         with llm._quiet_stdout():
-            enter.wait()          # both threads are now inside the redirect
+            enter.wait()
             release.set()
-            wait_for.wait()       # exit in a staggered order
+            wait_for.wait()
 
     a_done, b_done = threading.Event(), threading.Event()
     ta = threading.Thread(target=worker, args=(a_done, b_done))
@@ -769,5 +874,78 @@ def test_quiet_stdout_survives_overlapping_threads(capsys: pytest.CaptureFixture
     ta.start(); tb.start(); ta.join(); tb.join()
 
     assert sys.stdout is real_stdout
-    print("payload")
-    assert capsys.readouterr().out == "payload\n"
+    print('payload')
+    assert capsys.readouterr().out == 'payload\n'
+
+
+# ── Anthropic extended thinking (LLMConfig.thinking) ────────────────────────
+
+
+def test_thinking_sent_to_anthropic_models() -> None:
+    """The mode reaches the wire as Anthropic's `thinking` object."""
+    msgs = [{'role': 'user', 'content': 'hi'}]
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(model='anthropic/claude-sonnet-5', thinking='disabled'), messages=msgs
+    )
+    assert kwargs['thinking'] == {'type': 'disabled'}
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(model='anthropic/claude-sonnet-5', thinking='adaptive'), messages=msgs
+    )
+    assert kwargs['thinking'] == {'type': 'adaptive'}
+
+
+def test_thinking_omitted_when_unset() -> None:
+    """Unset means 'say nothing', which leaves the model's own default in
+    force — deliberately NOT the same as 'disabled'."""
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(model='anthropic/claude-sonnet-5'),
+        messages=[{'role': 'user', 'content': 'hi'}],
+    )
+    assert 'thinking' not in kwargs
+
+
+def test_thinking_not_sent_to_non_anthropic_models() -> None:
+    """The field is Anthropic-shaped; other providers spell reasoning their
+    own way and reject it."""
+    for model in ('gemini/gemini-2.5-pro', 'openai/gpt-5'):
+        kwargs = llm._build_completion_kwargs(
+            llm.LLMConfig(model=model, thinking='disabled'),
+            messages=[{'role': 'user', 'content': 'hi'}],
+        )
+        assert 'thinking' not in kwargs, model
+
+
+def test_reasoning_effort_wins_over_thinking() -> None:
+    """litellm translates reasoning_effort into the same Anthropic field, so
+    sending both would contradict itself. The caller's explicit effort wins."""
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(
+            model='anthropic/claude-sonnet-5', reasoning_effort='high', thinking='disabled'
+        ),
+        messages=[{'role': 'user', 'content': 'hi'}],
+    )
+    assert kwargs['reasoning_effort'] == 'high'
+    assert 'thinking' not in kwargs
+
+
+def test_thinking_still_sent_when_reasoning_effort_was_dropped() -> None:
+    """A forced tool_choice drops reasoning_effort for Anthropic, which frees
+    the field — so the configured mode applies rather than silently vanishing."""
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(
+            model='anthropic/claude-sonnet-5', reasoning_effort='high', thinking='disabled'
+        ),
+        messages=[{'role': 'user', 'content': 'hi'}],
+        tools=[{'type': 'function', 'function': {'name': 'f', 'parameters': {}}}],
+        tool_choice={'type': 'function', 'function': {'name': 'f'}},
+    )
+    assert 'reasoning_effort' not in kwargs
+    assert kwargs['thinking'] == {'type': 'disabled'}
+
+
+def test_invalid_thinking_mode_rejected_at_construction() -> None:
+    """A typo is a config error; catching it here names the value instead of
+    letting the provider answer 400 mid-run."""
+    with pytest.raises(ValueError, match='thinking must be one of'):
+        llm.LLMConfig(model='anthropic/claude-sonnet-5', thinking='enabled')
+

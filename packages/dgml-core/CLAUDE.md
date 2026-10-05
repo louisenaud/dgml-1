@@ -27,6 +27,34 @@ a workspace calls; `Workspace.resolve(...)` only answers "which workspace" and
 is for the handful of operations that run before one exists. Creating one is
 `create_workspace(...)`, not a `Workspace` constructor.
 
+## Logging
+
+Library code logs through `logger = logging.getLogger(__name__)`, so every
+record lands under `dgml_core.*`. Never `print`, never write to `sys.stderr`,
+never use `warnings.warn` for runtime events, and never configure handlers,
+levels or formats. The caller routes. `__init__.py` attaches a `NullHandler`
+to `dgml_core`, so a caller that configures nothing sees nothing. The `dgml`
+CLI is one such caller (`_configure_logging` in `cli.py`). Levels:
+
+- **WARNING**: the user must act, or the output is degraded (a tier fallback,
+  an unreachable model, a missing OCR provider). The CLI shows these by default.
+- **INFO**: what `dgml --verbose` shows (hybrid merge decisions, per-page
+  failures, workspace-upgrade notices).
+- **DEBUG**: detail beyond `--verbose`. No CLI switch maps to it (`DGML_DEBUG=1`
+  is just an env-var alias for `--verbose`); library callers opt in with
+  `logging.getLogger("dgml_core").setLevel(DEBUG)`.
+
+A warning that a per-file or per-page loop would repeat is deduped through
+module-level `_WARNED_*` state (`models_config.py`, `ocr.py`, `rotation.py`),
+keyed by whatever makes a recurrence informative — a `(tier, fallback)` pair, a
+workspace root, or nothing (a bool) when the condition is process-global. Tests
+reset that state in an autouse fixture.
+
+Structured events a caller may act on belong in return values or a typed
+callback (`on_migration`), not in log text. `debug=` controls telemetry and
+intermediate files, never log output. Tests assert with pytest's `caplog`, not
+`capsys`.
+
 ## Optional extras
 
 `aws`, `azure`, `macos`, `pdfium`, `clustering`, and `chain` are declared
@@ -37,19 +65,29 @@ rename one.
 ## OCR providers
 
 `--text-mode ocr` dispatches through an `OcrProvider` ABC defined in
-[src/dgml_core/ocr.py](src/dgml_core/ocr.py). Concrete providers live in sibling
-modules — `src/dgml_core/ocr_aws.py`, `src/dgml_core/ocr_azure.py`,
-`src/dgml_core/ocr_macos.py` — and register themselves via the `_PROVIDERS`
-dict at the bottom of `ocr.py`.
+[src/dgml_core/ocr.py](src/dgml_core/ocr.py). Like `[conversion]` and
+`[storage]`, `ocr.provider` is a dotted `"module.path:ClassName"` resolved at
+use time via `dgml_core.provider.import_provider_class` — **there is no registry
+of privileged classes.** The providers DGML bundles
+(`src/dgml_core/ocr_aws.py`, `src/dgml_core/ocr_azure.py`,
+`src/dgml_core/ocr_macos.py`) are named by exactly the same kind of path a third
+party's would be; `BUILTIN_OCR_PROVIDERS` maps the short names `aws` / `azure` /
+`macos` onto them so existing configs keep working.
 
 Each provider owns three things: its SDK lazy-import (in `__init__`),
-its config-section validation (`parse_config` classmethod), and its
-per-page API call (`analyze_image`). The shared loop in
-`extract_text_ocr` handles filesystem I/O and result aggregation —
-providers never touch the disk.
+its config-option validation (`parse_config` classmethod, which receives the
+`[ocr]` table minus `provider` as `config.options`), and its per-page API call
+(`analyze_image`). The shared loop in `extract_text_ocr` handles filesystem I/O
+and result aggregation — providers never touch the disk.
 
-To add a new provider: see the "Adding a new provider" section in the
-[src/dgml_core/ocr.py](src/dgml_core/ocr.py) module docstring.
+Unlike `load_conversion_config`, `load_ocr_config` resolves the provider class
+and runs its validation **eagerly**: `file add` validates OCR config before it
+touches the filesystem, so a bad `[ocr]` table is rejected with no record
+created. A workspace names exactly one OCR provider, so there is no fan-out cost.
+
+To write a new provider: see the "Writing your own provider" section in the
+[src/dgml_core/ocr.py](src/dgml_core/ocr.py) module docstring, and
+[docs/ocr-providers.md](../../docs/ocr-providers.md).
 
 ## PDF engines
 

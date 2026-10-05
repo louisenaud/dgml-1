@@ -44,13 +44,13 @@ from .text_extraction import split_word_into_tokens
 
 
 class MacosProvider(OcrProvider):
-    name: ClassVar[OcrProviderName] = OcrProviderName.MACOS
+    name: ClassVar[str] = OcrProviderName.MACOS.value
     config_fields: ClassVar[frozenset[str]] = frozenset()
 
     @classmethod
-    def parse_config(cls, section: dict[str, Any]) -> OcrConfig:
-        cls._check_no_extra_fields(section)
-        return OcrConfig(provider=cls.name)
+    def parse_config(cls, config: OcrConfig) -> OcrConfig:
+        cls._check_no_extra_fields(config.options)
+        return config
 
     def __init__(self, config: OcrConfig) -> None:
         if sys.platform != "darwin":

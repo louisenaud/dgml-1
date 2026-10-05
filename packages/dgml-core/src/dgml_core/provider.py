@@ -13,10 +13,11 @@
 """Resolving a dotted ``"module.path:ClassName"`` provider string to its class.
 
 DGML lets a third party name an implementation by dotted path in ``config.toml`` —
-a workspace's blob store and document store (:mod:`dgml_core.storage_resolve`), and
-the machine's store of workspaces (:mod:`dgml_core.workspaces_resolve`). All of them
-need the same import-then-check-the-base-class step, with the same actionable
-messages, so it lives here once.
+a workspace's blob store and document store (:mod:`dgml_core.storage_resolve`), the
+machine's store of workspaces (:mod:`dgml_core.workspaces_resolve`), and the
+workspace's OCR backend (:mod:`dgml_core.ocr`). All of them need the same
+import-then-check-the-base-class step, with the same actionable messages, so it lives
+here once.
 
 The base-class check is load-bearing beyond catching typos: it is what keeps the
 provider namespaces from bleeding into each other. A ``[storage]`` table naming a
@@ -33,6 +34,7 @@ import it without a cycle.
 from __future__ import annotations
 
 import importlib
+import inspect
 from collections.abc import Mapping
 from typing import Any, ClassVar
 
@@ -51,7 +53,11 @@ class ProviderConfigFields:
     Shared rather than copied so the two sections cannot drift apart in wording, and
     so a third provider kind gets the same behaviour by inheriting it."""
 
-    #: The provider's short name, used in failure messages.
+    #: The provider's short name, used in failure messages. Annotated rather than
+    #: defaulted because every bundled provider sets it — but an ABC cannot enforce
+    #: a ClassVar the way it enforces an abstract method, so a third party's class
+    #: may omit it. :meth:`_describe` falls back to the class name rather than
+    #: letting an AttributeError escape from the error path.
     name: ClassVar[str]
 
     #: Option keys this provider accepts. Empty means "no options at all".
@@ -64,12 +70,23 @@ class ProviderConfigFields:
     config_error: ClassVar[type[DgmlError]] = StorageConfigInvalid
 
     @classmethod
+    def _describe(cls) -> str:
+        """The provider's name for failure messages, falling back to the class name.
+
+        A third party's provider that forgot to declare ``name`` is a config error
+        waiting to be *reported*, not a reason for the reporting itself to raise —
+        without this, a user's typo'd option surfaces as ``INTERNAL_ERROR`` from an
+        AttributeError instead of the section's own actionable code.
+        """
+        return getattr(cls, "name", cls.__name__)
+
+    @classmethod
     def _check_no_extra_fields(cls, options: Mapping[str, Any]) -> None:
         """Raise ``cls.config_error`` for any option key not in ``cls.config_fields``."""
         unknown = set(options) - cls.config_fields
         if unknown:
             raise cls.config_error(
-                f"unknown fields in {cls.config_section!r} for provider {cls.name!r}: "
+                f"unknown fields in {cls.config_section!r} for provider {cls._describe()!r}: "
                 f"{sorted(unknown)}. Allowed: {sorted(cls.config_fields)}"
             )
 
@@ -80,45 +97,60 @@ def import_provider_class(
     *,
     kind: str = "storage",
     default_hint: str | None = None,
+    error: type[DgmlError] = StorageProviderUnresolvable,
 ) -> Any:
     """Import the dotted ``"module.path:ClassName"`` ``provider`` and check it is a
     subclass of ``base``.
 
-    ``kind`` names the config section in failure messages ("storage", "workspaces");
-    ``default_hint`` is the bundled provider to suggest when the string is malformed,
-    omitted when the section has no default worth naming.
+    ``kind`` names the config section in failure messages ("storage", "workspaces",
+    "ocr"); ``default_hint`` is the bundled provider to suggest when the string is
+    malformed, omitted when the section has no default worth naming.
 
-    Raises :class:`~dgml_core.errors.StorageProviderUnresolvable` if the string is
-    malformed, the module/attribute can't be imported, or the target is not a ``base``
-    subclass — the last catches "a doc provider used where a blob provider is
-    required", and equally "a store used where a workspaces store is required".
+    ``error`` is the exception raised for every failure here, so a section keeps its
+    own documented error code rather than borrowing storage's: the ``[ocr]`` table
+    reports :class:`~dgml_core.errors.OcrConfigInvalid` (``OCR_CONFIG_INVALID``), the
+    same way :attr:`ProviderConfigFields.config_error` already lets a section own the
+    unknown-field failure.
+
+    Raises ``error`` if the string is malformed, the module/attribute can't be
+    imported, or the target is not a ``base`` subclass — the last catches "a doc
+    provider used where a blob provider is required", and equally "a store used where
+    a workspaces store is required".
     Returns the class (``Any``: it is a concrete subclass only known at runtime)."""
     if ":" not in provider:
         hint = f"; the bundled default is {default_hint!r}" if default_hint else ""
-        raise StorageProviderUnresolvable(
+        raise error(
             f"{kind} provider must be a dotted path 'module.path:ClassName' "
             f"(got {provider!r}){hint}"
         )
     module_path, _, class_name = provider.partition(":")
     if not module_path or not class_name:
-        raise StorageProviderUnresolvable(
-            f"{kind} provider {provider!r} must have the form 'module.path:ClassName'"
-        )
+        raise error(f"{kind} provider {provider!r} must have the form 'module.path:ClassName'")
     try:
         module = importlib.import_module(module_path)
     except ImportError as exc:
-        raise StorageProviderUnresolvable(
+        raise error(
             f"could not import {kind} module {module_path!r} for provider {provider!r}: "
             f"{exc}. Is the package installed in this environment?"
         ) from exc
     try:
         obj = getattr(module, class_name)
     except AttributeError as exc:
-        raise StorageProviderUnresolvable(
+        raise error(
             f"module {module_path!r} has no attribute {class_name!r} (provider {provider!r})"
         ) from exc
     if not (isinstance(obj, type) and issubclass(obj, base)):
-        raise StorageProviderUnresolvable(
+        raise error(
             f"provider {provider!r} resolved to {obj!r}, which is not a {base.__name__} subclass"
+        )
+    # `issubclass` is satisfied by the ABC itself and by any half-finished subclass,
+    # neither of which can be instantiated. Rejecting them here keeps the failure a
+    # config error naming the provider, rather than a TypeError from deep in
+    # construction that surfaces as INTERNAL_ERROR.
+    if inspect.isabstract(obj):
+        missing = sorted(getattr(obj, "__abstractmethods__", ()))
+        raise error(
+            f"provider {provider!r} resolved to abstract class {obj.__name__!r} "
+            f"(missing implementations: {missing}). Name a concrete subclass."
         )
     return obj

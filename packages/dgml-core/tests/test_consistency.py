@@ -359,6 +359,6 @@ def test_reextract_hybrid_threads_debug(
     fid = "fid"
     workspace.blobs.put_blob(f"files/{fid}/doc.pdf", b"%PDF-1.4\n")
     source_key = layout.file_source_key(fid, "doc.pdf")
-    _reextract(workspace, source_key, fid, "hybrid", verbose=False, debug=debug)
+    _reextract(workspace, source_key, fid, "hybrid", debug=debug)
 
     assert captured["debug"] is debug

@@ -20,12 +20,13 @@ CLI, including the ``--verbose`` per-page diagnostics on stderr.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
 from dgml.cli import main
-from dgml_core.ocr import OcrConfig, OcrProvider, OcrProviderName
+from dgml_core.ocr import BUILTIN_OCR_PROVIDERS, OcrConfig, OcrProvider, OcrProviderName
 from dgml_core.storage import Workspace
 
 from .conftest import make_fake_png, write_ocr_config
@@ -41,12 +42,14 @@ def _install_fake_provider(
     words_by_page: dict[int, list[dict[str, Any]]] | None = None,
 ) -> None:
     class FakeProvider(OcrProvider):
-        name = OcrProviderName.AZURE
-        config_fields = frozenset[str]()
+        name = OcrProviderName.AZURE.value
+        # Stands in for Azure, so it declares Azure's option: the framework rejects
+        # anything a provider doesn't name, whether or not parse_config checks.
+        config_fields = frozenset({"endpoint"})
 
         @classmethod
-        def parse_config(cls, section: dict[str, Any]) -> OcrConfig:
-            return OcrConfig(provider=cls.name)
+        def parse_config(cls, config: OcrConfig) -> OcrConfig:
+            return config
 
         def __init__(self, config: OcrConfig) -> None:
             self.config = config
@@ -61,9 +64,13 @@ def _install_fake_provider(
                 return []
             return list(words_by_page.get(page_num, []))
 
-    from dgml_core.ocr import _PROVIDERS
-
-    monkeypatch.setitem(_PROVIDERS, OcrProviderName.AZURE, FakeProvider)
+    # Repoint the "azure" alias at the fake rather than reaching into a registry:
+    # these tests drive the workspace config, which says provider = "azure", so the
+    # real resolver still runs end to end.
+    monkeypatch.setattr(sys.modules[__name__], "FakeProvider", FakeProvider, raising=False)
+    monkeypatch.setitem(
+        BUILTIN_OCR_PROVIDERS, OcrProviderName.AZURE.value, f"{__name__}:FakeProvider"
+    )
 
 
 def _seed_page_images(pages_dir: Path, n: int, w: int = 612, h: int = 792) -> None:

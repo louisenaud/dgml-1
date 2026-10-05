@@ -77,16 +77,22 @@ heuristic for *that batch's* regions only; other batches keep their LLM
 result, so a flaky local model degrades gracefully. See :func:`_llm_emit_plan`
 for the request/response contract.
 
-Warnings are emitted to stderr — stdout is reserved for the CLI's JSON
-payload contract — and are gated behind a ``verbose`` flag. By default
-hybrid mode is silent; pass ``verbose=True`` (set by ``dgml --verbose``
-on the CLI) to see the per-page warnings and summary.
+Per-page diagnostics and the per-page summary are logged at INFO on this
+module's logger (``dgml_core.hybrid``); guard-handled pages — full-page
+scans, unresolved-glyph pages — log their guard notice in place of the
+summary. The caller decides where they go; with no logging configured they
+go nowhere. Everything is INFO on purpose —
+even an unreachable merge LLM, because the heuristic fallback still produces
+complete output, so nothing here demands the caller act (contrast
+``style_llm``, where an unreachable model leaves the document unstyled and
+WARNs). Significant-but-normal lines — fallbacks, drops, OCR overriding
+digital — carry a ``notice:`` prefix so they stand out in verbose output.
 """
 
 from __future__ import annotations
 
 import json
-import sys
+import logging
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -106,6 +112,8 @@ from .text_extraction import (
 )
 from .text_extraction_config import TextExtractionConfig, resolve_api_key
 from .usage import OPERATION_HYBRID_MERGE
+
+logger = logging.getLogger(__name__)
 
 OVERLAP_THRESHOLD = 0.5
 # Two boxes also count as overlapping when one is at least this fraction
@@ -168,13 +176,12 @@ def extract_text_hybrid(
     text_extraction_config: TextExtractionConfig | None = None,
     workspace: Workspace | None = None,
     dpi: int = DEFAULT_DPI,
-    verbose: bool = False,
     debug: bool = False,
 ) -> ExtractDigitalResult:
     """Run digital extraction then OCR and merge the per-page results.
 
     If digital extraction itself fails (pdfminer can't parse the PDF), log
-    a stderr warning (when ``verbose``) and continue with OCR-only output
+    it (INFO) and continue with OCR-only output
     rather than aborting — OCR is the authoritative source in hybrid mode.
     An OCR failure is propagated to the caller (same as ``--text-mode ocr``).
 
@@ -198,12 +205,12 @@ def extract_text_hybrid(
             extract_text_digital(pdf_path, digital_dir, file_id=file_id, dpi=dpi)
         except TextExtractionFailed as exc:
             digital_failed = True
-            if verbose:
-                print(
-                    f"warning: file_id={file_id}: digital extraction failed; "
-                    f"falling back to OCR-only output: {exc}",
-                    file=sys.stderr,
-                )
+            logger.info(
+                "notice: file_id=%s: digital extraction failed; "
+                "falling back to OCR-only output: %s",
+                file_id,
+                exc,
+            )
 
         # Which pages are scans decides whether their digital text may be
         # trusted at all, so probe before merging. Only worth the pass when
@@ -228,7 +235,6 @@ def extract_text_hybrid(
             raster_pages=raster_pages,
             text_extraction_config=text_extraction_config,
             workspace=workspace,
-            verbose=verbose,
             debug=debug,
         )
 
@@ -242,7 +248,6 @@ def _merge_into(
     raster_pages: set[int] | None = None,
     text_extraction_config: TextExtractionConfig | None = None,
     workspace: Workspace | None = None,
-    verbose: bool = False,
     debug: bool = False,
 ) -> ExtractDigitalResult:
     """Merge per-page JSONs from ``digital_dir`` and ``ocr_dir`` into ``output_dir``."""
@@ -297,7 +302,6 @@ def _merge_into(
             raster_page=page_num in (raster_pages or set()),
             text_extraction_config=text_extraction_config,
             workspace=workspace,
-            verbose=verbose,
             debug=debug,
         )
 
@@ -323,7 +327,6 @@ def _merge_words(
     raster_page: bool = False,
     text_extraction_config: TextExtractionConfig | None = None,
     workspace: Workspace | None = None,
-    verbose: bool = False,
     debug: bool = False,
 ) -> list[dict[str, Any]]:
     """Apply the merge rules described in the module docstring.
@@ -332,44 +335,33 @@ def _merge_words(
     Levenshtein heuristic resolves each region (:func:`_heuristic_emit_plan`).
     Otherwise the configured LLM does (:func:`_llm_emit_plan`), with a
     fall-back to the heuristic for the page on any failure. Per-page warnings
-    and summary go to stderr only when ``verbose`` is set.
+    and summary are logged at INFO.
     """
     # A scan's digital text is a previous OCR pass baked into the PDF, so it
     # is not the authority the mixed-region rule assumes. Drop it wholesale
     # rather than let it override our own read of the same ink. A scanned page
     # with no digital text needs no guard - the merge already yields OCR.
     if raster_page and digital_words:
-        if verbose:
-            print(
-                f"scan guard: file_id={file_id} page={page_num}: page is a "
-                f"full-page raster image, so its {len(digital_words)} digital "
-                f"words are an OCR layer baked in by the scanner, not the "
-                f"document's own character codes; using OCR for the entire page",
-                file=sys.stderr,
-            )
-            print(
-                f"hybrid: file_id={file_id} page={page_num}: "
-                f"digital_words={len(digital_words)} ocr_words={len(ocr_words)} "
-                f"merged={len(ocr_words)} scan_guard=true",
-                file=sys.stderr,
-            )
+        logger.info(
+            "scan guard: file_id=%s page=%s: page is a full-page raster image, "
+            "so its %s digital words are an OCR layer baked in by the scanner, "
+            "not the document's own character codes; using OCR for the entire page",
+            file_id,
+            page_num,
+            len(digital_words),
+        )
         return list(ocr_words)
 
     cid_count = _count_cid_words(digital_words)
     if cid_count > MAX_CID_WORDS_PER_PAGE:
-        if verbose:
-            print(
-                f"unicode error: file_id={file_id} page={page_num}: digital text "
-                f"has {cid_count} words containing '(cid:' (pdfminer could not "
-                f"resolve glyphs); using OCR for the entire page",
-                file=sys.stderr,
-            )
-            print(
-                f"hybrid: file_id={file_id} page={page_num}: "
-                f"digital_words={len(digital_words)} ocr_words={len(ocr_words)} "
-                f"merged={len(ocr_words)} cid_guard=true",
-                file=sys.stderr,
-            )
+        logger.info(
+            "unicode error: file_id=%s page=%s: digital text has %s words "
+            "containing '(cid:' (pdfminer could not resolve glyphs); "
+            "using OCR for the entire page",
+            file_id,
+            page_num,
+            cid_count,
+        )
         return list(ocr_words)
 
     regions = _region_overlaps(digital_words, ocr_words)
@@ -385,7 +377,6 @@ def _merge_words(
                 page_num=page_num,
                 config=text_extraction_config,
                 workspace=workspace,
-                verbose=verbose,
                 debug=debug,
             )
         except Exception as exc:
@@ -393,12 +384,13 @@ def _merge_words(
             # _llm_emit_plan, so reaching here means an unexpected error
             # escaped it — leave emit_plan unset and fall back to the heuristic
             # for the whole page below.
-            if verbose:
-                print(
-                    f"warning: file_id={file_id} page={page_num}: LLM merge failed "
-                    f"({type(exc).__name__}: {exc}); falling back to heuristic",
-                    file=sys.stderr,
-                )
+            logger.info(
+                "notice: file_id=%s page=%s: LLM merge failed (%s: %s); falling back to heuristic",
+                file_id,
+                page_num,
+                type(exc).__name__,
+                exc,
+            )
 
     # Heuristic merge when no LLM is configured, or the LLM merge failed above.
     if emit_plan is None:
@@ -408,7 +400,6 @@ def _merge_words(
             ocr_words,
             file_id=file_id,
             page_num=page_num,
-            verbose=verbose,
         )
 
     merged: list[dict[str, Any]] = []
@@ -421,13 +412,14 @@ def _merge_words(
     # their own "s" untouched.
     merged = _apply_digital_style(merged, digital_words)
 
-    if verbose:
-        print(
-            f"hybrid: file_id={file_id} page={page_num}: "
-            f"digital_words={len(digital_words)} ocr_words={len(ocr_words)} "
-            f"merged={len(merged)}",
-            file=sys.stderr,
-        )
+    logger.info(
+        "hybrid: file_id=%s page=%s: digital_words=%s ocr_words=%s merged=%s",
+        file_id,
+        page_num,
+        len(digital_words),
+        len(ocr_words),
+        len(merged),
+    )
     return merged
 
 
@@ -474,6 +466,41 @@ def _box_overlap_fraction(a: list[int], b: list[int]) -> float:
     return inter / area_a
 
 
+# At most this many dropped tokens are spelled out in the page's dropped-words
+# log line; the rest are a count. Keeps a watermark or hidden text layer from
+# flooding the log while still naming what was dropped.
+_DROP_LOG_SAMPLE = 8
+
+
+def _log_dropped_digital_only(
+    digital_words: list[dict[str, Any]],
+    d_idxs: list[int],
+    *,
+    file_id: str,
+    page_num: int,
+) -> None:
+    """One INFO line per page for its digital-only words: OCR saw nothing where
+    they sit, so they are assumed invisible to the human eye and dropped.
+    Digital-only words never share a region (regions form around digital↔OCR
+    overlaps), so callers accumulate them across the page and log once."""
+    if not d_idxs or not logger.isEnabledFor(logging.INFO):
+        return
+    texts = [
+        str(digital_words[i].get("t", "")) for i in _reading_order_indices(d_idxs, digital_words)
+    ]
+    shown = texts[:_DROP_LOG_SAMPLE]
+    suffix = "" if len(texts) <= _DROP_LOG_SAMPLE else f" (+{len(texts) - _DROP_LOG_SAMPLE} more)"
+    logger.info(
+        "notice: file_id=%s page=%s: %s digital word(s) not detected by OCR; "
+        "assumed invisible to human eye, dropping: %r%s",
+        file_id,
+        page_num,
+        len(texts),
+        shown,
+        suffix,
+    )
+
+
 # `emit_plan[o_idx]` overrides what an OCR word emits: a list of words to
 # splice in at that position, or `[]` to drop it. OCR words absent from the
 # plan (and those with malformed boxes, which never region) emit themselves —
@@ -485,36 +512,20 @@ def _heuristic_emit_plan(
     *,
     file_id: str,
     page_num: int,
-    verbose: bool,
 ) -> dict[int, list[dict[str, Any]]]:
     """Resolve regions with the Levenshtein heuristic (the default merge)."""
     emit_plan: dict[int, list[dict[str, Any]]] = {}
+    dropped: list[int] = []
 
     for d_idxs, o_idxs in regions:
         if not o_idxs:
             # Digital-only region: no visual counterpart, assume invisible.
-            if verbose:
-                for di in d_idxs:
-                    dw = digital_words[di]
-                    print(
-                        f"warning: file_id={file_id} page={page_num}: digital text "
-                        f"{dw.get('t', '')!r} at {dw.get('l')} was not detected by "
-                        f"OCR; assumed invisible to human eye, dropping",
-                        file=sys.stderr,
-                    )
+            dropped.extend(d_idxs)
             continue
 
         if not d_idxs:
-            # OCR-only region: keep, log which tokens OCR contributed.
-            if verbose:
-                for oi in o_idxs:
-                    ow = ocr_words[oi]
-                    print(
-                        f"info: file_id={file_id} page={page_num}: OCR text "
-                        f"{ow.get('t', '')!r} at {ow.get('l')} has no matching "
-                        f"digital text; keeping OCR",
-                        file=sys.stderr,
-                    )
+            # OCR-only region: keep. The words emit themselves (absent from
+            # emit_plan) — the default outcome, so nothing to log.
             continue
 
         # Mixed region. Compare concatenated text (dash-normalized) to decide
@@ -537,21 +548,20 @@ def _heuristic_emit_plan(
                 if oi != anchor:
                     emit_plan[oi] = []
 
-        if verbose:
-            _log_region_decision(
-                file_id=file_id,
-                page_num=page_num,
-                digital_words=digital_words,
-                ocr_words=ocr_words,
-                d_idxs=d_idxs,
-                o_idxs=o_idxs,
-                d_text=d_concat,
-                o_text=o_concat,
-                dist=dist,
-                agree=agree,
-                take_digital=take_digital,
-            )
+        _log_region_decision(
+            file_id=file_id,
+            page_num=page_num,
+            digital_words=digital_words,
+            ocr_words=ocr_words,
+            d_idxs=d_idxs,
+            o_idxs=o_idxs,
+            d_text=d_concat,
+            o_text=o_concat,
+            dist=dist,
+            agree=agree,
+        )
 
+    _log_dropped_digital_only(digital_words, dropped, file_id=file_id, page_num=page_num)
     return emit_plan
 
 
@@ -574,7 +584,6 @@ def _llm_emit_plan(
     page_num: int,
     config: TextExtractionConfig,
     workspace: Workspace | None,
-    verbose: bool,
     debug: bool = False,
 ) -> dict[int, list[dict[str, Any]]]:
     """Resolve regions with the configured LLM, batched across requests.
@@ -591,33 +600,18 @@ def _llm_emit_plan(
     """
     emit_plan: dict[int, list[dict[str, Any]]] = {}
     to_send: list[_RegionToSend] = []
+    dropped: list[int] = []
 
     for n, (d_idxs, o_idxs) in enumerate(regions):
         if not o_idxs:
             # Digital-only region: dropped, same as the heuristic. No LLM call.
-            if verbose:
-                for di in d_idxs:
-                    dw = digital_words[di]
-                    print(
-                        f"warning: file_id={file_id} page={page_num}: digital text "
-                        f"{dw.get('t', '')!r} at {dw.get('l')} was not detected by "
-                        f"OCR; assumed invisible to human eye, dropping",
-                        file=sys.stderr,
-                    )
+            dropped.extend(d_idxs)
             continue
 
         if not d_idxs:
             # OCR-only region: keep, same as the heuristic. No LLM call — the
-            # OCR words emit themselves (absent from emit_plan).
-            if verbose:
-                for oi in o_idxs:
-                    ow = ocr_words[oi]
-                    print(
-                        f"info: file_id={file_id} page={page_num}: OCR text "
-                        f"{ow.get('t', '')!r} at {ow.get('l')} has no matching "
-                        f"digital text; keeping OCR",
-                        file=sys.stderr,
-                    )
+            # OCR words emit themselves (absent from emit_plan), the default
+            # outcome, so nothing to log.
             continue
 
         if _tokens_identical(d_idxs, o_idxs, digital_words, ocr_words):
@@ -642,6 +636,8 @@ def _llm_emit_plan(
         ]
         sort_key = _region_sort_key(d_idxs, o_idxs, digital_words, ocr_words)
         to_send.append((sort_key, rid, d_idxs, o_idxs, entry))
+
+    _log_dropped_digital_only(digital_words, dropped, file_id=file_id, page_num=page_num)
 
     if not to_send:
         return emit_plan
@@ -669,32 +665,32 @@ def _llm_emit_plan(
                 ocr_words=ocr_words,
                 file_id=file_id,
                 page_num=page_num,
-                verbose=verbose,
             )
         except Exception as exc:
-            if verbose:
-                batch_num = start // MERGE_BATCH_SIZE + 1
-                print(
-                    f"warning: file_id={file_id} page={page_num}: LLM merge failed "
-                    f"for batch {batch_num} ({len(batch)} regions) "
-                    f"({type(exc).__name__}: {exc}); falling back to heuristic "
-                    f"for this batch",
-                    file=sys.stderr,
+            logger.info(
+                "notice: file_id=%s page=%s: LLM merge failed for batch %s "
+                "(%s regions) (%s: %s); falling back to heuristic for this batch",
+                file_id,
+                page_num,
+                start // MERGE_BATCH_SIZE + 1,
+                len(batch),
+                type(exc).__name__,
+                exc,
+            )
+            raw_output = getattr(exc, "raw_output", None)
+            if raw_output is not None:
+                logger.info(
+                    "notice: file_id=%s page=%s: LLM merge raw output was: %r",
+                    file_id,
+                    page_num,
+                    raw_output,
                 )
-                raw_output = getattr(exc, "raw_output", None)
-                if raw_output is not None:
-                    print(
-                        f"warning: file_id={file_id} page={page_num}: LLM merge raw "
-                        f"output was: {raw_output!r}",
-                        file=sys.stderr,
-                    )
             batch_plan = _heuristic_emit_plan(
                 [(d_idxs, o_idxs) for _key, _rid, d_idxs, o_idxs, _entry in batch],
                 digital_words,
                 ocr_words,
                 file_id=file_id,
                 page_num=page_num,
-                verbose=verbose,
             )
         emit_plan.update(batch_plan)
 
@@ -709,7 +705,6 @@ def _resolve_batch_decisions(
     ocr_words: list[dict[str, Any]],
     file_id: str,
     page_num: int,
-    verbose: bool,
 ) -> dict[int, list[dict[str, Any]]]:
     """Turn one batch's LLM response into an emit-plan fragment.
 
@@ -732,7 +727,7 @@ def _resolve_batch_decisions(
         for oi in o_idxs:
             if oi != anchor:
                 batch_plan[oi] = []
-        if verbose:
+        if logger.isEnabledFor(logging.INFO):
             d_texts = [
                 str(digital_words[i].get("t", ""))
                 for i in _reading_order_indices(d_idxs, digital_words)
@@ -741,12 +736,18 @@ def _resolve_batch_decisions(
                 str(ocr_words[j].get("t", "")) for j in _reading_order_indices(o_idxs, ocr_words)
             ]
             accepted = [str(w.get("t", "")) for w in resolved]
-            print(
-                f"info: file_id={file_id} page={page_num}: LLM resolved mixed "
-                f"region {rid} ({len(d_idxs)} digital, {len(o_idxs)} OCR); "
-                f"digital={d_texts!r} ocr={o_texts!r} "
-                f"-> {len(resolved)} token(s): {accepted!r}",
-                file=sys.stderr,
+            logger.info(
+                "file_id=%s page=%s: LLM resolved mixed region %s "
+                "(%s digital, %s OCR); digital=%r ocr=%r -> %s token(s): %r",
+                file_id,
+                page_num,
+                rid,
+                len(d_idxs),
+                len(o_idxs),
+                d_texts,
+                o_texts,
+                len(resolved),
+                accepted,
             )
 
     return batch_plan
@@ -923,32 +924,42 @@ def _log_region_decision(
     o_text: str,
     dist: int,
     agree: bool,
-    take_digital: bool,
 ) -> None:
-    """Emit the stderr line(s) describing how one mixed region was resolved."""
+    """Log (INFO) how one mixed region was resolved — only when the two sides'
+    text disagrees, i.e. OCR overrode the PDF's own characters. Agreement is
+    the designed outcome, whatever the tokenization, and stays silent."""
+    if agree:
+        return
     if len(d_idxs) == 1 and len(o_idxs) == 1:
-        # Clean 1:1 — digital silently wins when the texts agree; only the
-        # disagreement (OCR wins) is worth a warning.
-        if not agree:
-            dw, ow = digital_words[d_idxs[0]], ocr_words[o_idxs[0]]
-            print(
-                f"warning: file_id={file_id} page={page_num}: digital text "
-                f"{dw.get('t', '')!r} and OCR text {ow.get('t', '')!r} overlap at "
-                f"digital={dw.get('l')} ocr={ow.get('l')} but differ "
-                f"(levenshtein={dist} > {LEVENSHTEIN_THRESHOLD}); using OCR",
-                file=sys.stderr,
-            )
+        dw, ow = digital_words[d_idxs[0]], ocr_words[o_idxs[0]]
+        logger.info(
+            "notice: file_id=%s page=%s: digital text %r and OCR text %r "
+            "overlap at digital=%s ocr=%s but differ (levenshtein=%s > %s); "
+            "using OCR",
+            file_id,
+            page_num,
+            dw.get("t", ""),
+            ow.get("t", ""),
+            dw.get("l"),
+            ow.get("l"),
+            dist,
+            LEVENSHTEIN_THRESHOLD,
+        )
         return
 
-    # Split / merge region.
-    kept = f"digital's {len(d_idxs)}" if take_digital else f"OCR's {len(o_idxs)}"
-    print(
-        f"info: file_id={file_id} page={page_num}: tokenization mismatch "
-        f"({len(d_idxs)} digital vs {len(o_idxs)} OCR words; "
-        f"text {'agrees' if agree else 'differs'}, levenshtein={dist}); "
-        f"digital={d_text!r} ocr={o_text!r}; "
-        f"keeping {kept} tokens",
-        file=sys.stderr,
+    # Split / merge region whose text differs → OCR's tokens win.
+    logger.info(
+        "notice: file_id=%s page=%s: tokenization mismatch (%s digital vs %s OCR "
+        "words; text differs, levenshtein=%s); digital=%r ocr=%r; "
+        "keeping OCR's %s tokens",
+        file_id,
+        page_num,
+        len(d_idxs),
+        len(o_idxs),
+        dist,
+        d_text,
+        o_text,
+        len(o_idxs),
     )
 
 

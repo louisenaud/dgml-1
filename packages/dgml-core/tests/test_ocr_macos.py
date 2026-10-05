@@ -33,13 +33,15 @@ _MACOS_CFG = OcrConfig(provider=OcrProviderName.MACOS)
 
 
 def test_macos_parse_config_happy() -> None:
-    cfg = MacosProvider.parse_config({"provider": "macos"})
-    assert cfg.provider is OcrProviderName.MACOS
+    cfg = MacosProvider.parse_config(_MACOS_CFG)
+    assert cfg.provider == OcrProviderName.MACOS
 
 
 def test_macos_parse_config_rejects_extra_fields() -> None:
     with pytest.raises(OcrConfigInvalid, match="unknown fields"):
-        MacosProvider.parse_config({"provider": "macos", "region": "us-east-1"})
+        MacosProvider.parse_config(
+            OcrConfig(provider=OcrProviderName.MACOS, options={"region": "us-east-1"})
+        )
 
 
 def test_macos_provider_raises_on_non_darwin(monkeypatch: pytest.MonkeyPatch) -> None:

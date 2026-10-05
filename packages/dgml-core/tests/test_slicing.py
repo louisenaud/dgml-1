@@ -108,6 +108,27 @@ def test_slice_defaults_to_ghostscript_when_no_config(eight_page_pdf: bytes) -> 
     assert PdfConfig().provider is EngineName.GHOSTSCRIPT
 
 
+def test_pypdfium2_slices_safely_from_concurrent_threads(
+    eight_page_pdf: bytes, tmp_path: Path
+) -> None:
+    """Generation slices on a per-document thread pool, but PDFium forbids
+    concurrent calls — the engine's module lock is what reconciles the two.
+    Every slice must come back correct, not just without crashing."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    cfg = PdfConfig(provider=EngineName.PYPDFIUM2)
+    requests = [[n] for n in range(1, 9)] * 4
+
+    def _slice(pages: list[int]) -> bytes:
+        return slice_pages(eight_page_pdf, pages, config=cfg, total_pages=8)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(_slice, requests))
+    for pages, out in zip(requests, results, strict=True):
+        assert pdf_page_count_bytes(out) == 1
+        assert f"Page {pages[0]} marker" in _text(out, tmp_path, name=f"c{pages[0]}.pdf")
+
+
 # ---------------------------------------------------------------------------
 # Argument validation — bounds-checked centrally so a bad request never
 # reaches a backend and surface as its own opaque IndexError.

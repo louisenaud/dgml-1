@@ -14,15 +14,34 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+from dgml.cli import _StderrHandler
 from dgml_core.pages import GS_BINARIES
 from dgml_core.storage import Workspace
 from dgml_core.workspaces_resolve import default_workspaces_store
 from dgml_core.workspaces_store import WORKSPACES_ENV_VAR
+
+
+@pytest.fixture(autouse=True)
+def _reset_cli_logging() -> Iterator[None]:
+    """Undo `main()`'s logging setup after each test.
+
+    `_configure_logging` puts a stderr handler and a level on the process-global
+    ``dgml_core`` / ``dgml`` loggers. Left in place, the last CLI test's level
+    (WARNING, or INFO after a ``--verbose`` run) would leak into whatever test
+    runs next — including library tests using ``caplog``."""
+    yield
+    for name in ("dgml_core", "dgml"):
+        log = logging.getLogger(name)
+        for h in [h for h in log.handlers if isinstance(h, _StderrHandler)]:
+            log.removeHandler(h)
+        log.setLevel(logging.NOTSET)
 
 
 def _toml_scalar(value: Any) -> str:

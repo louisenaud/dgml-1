@@ -65,7 +65,7 @@ def test_aws_missing_sdk_raises_missing_extra(
     """An uninstalled `aws` extra is `MissingExtra` with the extra named as a field,
     matching the Azure provider — not `OcrFailed`, which is a provider/API failure."""
     monkeypatch.setitem(sys.modules, "boto3", None)
-    cfg = OcrConfig(provider=OcrProviderName.AWS, region="us-east-1")
+    cfg = OcrConfig(provider=OcrProviderName.AWS, options={"region": "us-east-1"})
     with pytest.raises(MissingExtra, match="pip install dgml\\[aws\\]") as caught:
         extract_text_ocr(
             text_pdf,
@@ -121,9 +121,7 @@ def test_aws_extract_writes_per_page_json(
 
     out_dir = tmp_path / "page_text"
     cfg = OcrConfig(
-        provider=OcrProviderName.AWS,
-        region="us-east-1",
-        profile="test-profile",
+        provider=OcrProviderName.AWS, options={"region": "us-east-1", "profile": "test-profile"}
     )
     result = extract_text_ocr(
         text_pdf,
@@ -153,7 +151,7 @@ def test_aws_extract_writes_per_page_json(
 def test_aws_extract_requires_page_images(
     aws_config: Workspace, text_pdf: Path, tmp_path: Path
 ) -> None:
-    cfg = OcrConfig(provider=OcrProviderName.AWS, region="us-east-1")
+    cfg = OcrConfig(provider=OcrProviderName.AWS, options={"region": "us-east-1"})
     with pytest.raises(OcrFailed, match="no page images"):
         extract_text_ocr(
             text_pdf,

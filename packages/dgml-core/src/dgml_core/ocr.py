@@ -17,24 +17,37 @@ configured provider, and writes the same per-page JSON shape as
 :func:`dgml.text_extraction.extract_text_digital` so downstream code
 (``dgml check``, consumers) doesn't care which mode produced the text.
 
-Provider implementations live in sibling modules so this file stays
+The providers DGML bundles live in sibling modules so this file stays
 focused on the abstraction:
 
-- :class:`dgml.ocr_macos.MacosProvider` — Apple Vision (on-device, the
-  zero-config default on macOS)
-- :class:`dgml.ocr_azure.AzureProvider` — Azure Document Intelligence
-- :class:`dgml.ocr_aws.AwsProvider` — AWS Textract
+- :class:`dgml_core.ocr_macos.MacosProvider` — Apple Vision (on-device,
+  the zero-config default on macOS)
+- :class:`dgml_core.ocr_azure.AzureProvider` — Azure Document Intelligence
+- :class:`dgml_core.ocr_aws.AwsProvider` — AWS Textract
 
-Adding a new provider
----------------------
+They hold no privileged position: each is named by the same dotted path a
+third party's own provider would use, and :data:`BUILTIN_OCR_PROVIDERS`
+maps the short names (``"aws"``, ``"azure"``, ``"macos"``) onto them as a
+convenience so existing configs keep working.
 
-1. Add a value to :class:`OcrProviderName`.
-2. Create a new module ``ocr_<name>.py`` with a subclass of
-   :class:`OcrProvider`. Implement ``__init__`` (lazy-import the SDK;
-   raise :class:`OcrFailed` if missing) and ``analyze_image``.
-3. Wire the subclass into ``_build_registry`` below.
-4. Extend :func:`load_ocr_config` to validate any provider-specific
-   config fields.
+Writing your own provider
+-------------------------
+
+1. ``pip install dgml-core`` (the wheel — no repo clone).
+2. Subclass :class:`OcrProvider`, implementing :meth:`~OcrProvider.parse_config`
+   (call :meth:`~dgml_core.provider.ProviderConfigFields._check_no_extra_fields`
+   first), ``__init__`` (lazy SDK import — raise
+   :class:`~dgml_core.errors.MissingExtra` if missing), and
+   :meth:`~OcrProvider.analyze_image`.
+3. Make the class importable by the interpreter running dgml.
+4. Point ``ocr.provider`` at it::
+
+       [ocr]
+       provider = "your_pkg.mod:YourProvider"
+       your_option = "…"
+
+   Fields other than ``provider`` are handed to your ``parse_config`` as
+   ``config.options``; declare the ones you accept in ``config_fields``.
 
 Cloud SDKs are **optional** runtime dependencies — install with
 ``pip install dgml[aws]`` or ``pip install dgml[azure]``. Calling an OCR
@@ -45,20 +58,22 @@ an actionable message.
 from __future__ import annotations
 
 import json
+import logging
 import struct
 import sys
-import warnings
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, replace
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, ClassVar
 
 from .concurrency import map_concurrent
 from .config import load_merged_config
-from .errors import OcrConfigInvalid, OcrConfigMissing, OcrFailed
+from .errors import DgmlError, OcrConfigInvalid, OcrConfigMissing, OcrFailed
 from .models_config import ConfigSection
 from .pages import PAGE_GLOB
+from .provider import ProviderConfigFields, import_provider_class
 from .rotation import deskew_page, should_rotate
 from .storage import Workspace
 from .text_extraction import (
@@ -66,6 +81,15 @@ from .text_extraction import (
     PAGE_TEXT_GLOB,
     ExtractDigitalResult,
 )
+
+logger = logging.getLogger(__name__)
+
+# Workspace roots whose missing-OCR-provider fallback was already announced this
+# process. A bulk add validates and then extracts — two `load_ocr_config` calls
+# per file — so without dedup the same line would repeat ~2N times. Keyed by
+# workspace root because the missing section is per-workspace state: a process
+# that opens a second, equally unconfigured workspace still hears about it.
+_WARNED_NO_OCR_PROVIDER: set[Path] = set()
 
 # Pages within a file are OCR'd concurrently (one provider call per page). This
 # is the default number of in-flight OCR calls; override per workspace with
@@ -75,12 +99,27 @@ DEFAULT_OCR_CONCURRENCY = 5
 
 
 class OcrProviderName(StrEnum):
-    """Identifier of an OCR backend, as written in workspace config."""
+    """Short name of an OCR backend DGML bundles.
+
+    A convenience spelling, not the namespace: ``ocr.provider`` accepts any
+    dotted ``"module.path:ClassName"``, and these three names resolve through
+    :data:`BUILTIN_OCR_PROVIDERS` to exactly such a path. Kept so the configs
+    people already have — and the docs that taught them — go on working.
+    """
 
     AZURE = "azure"
     AWS = "aws"
     MACOS = "macos"
 
+
+#: Short name → the dotted path it stands for. The bundled providers are
+#: resolved by the same importer as a third party's, so there is no registry of
+#: privileged classes here — only aliases.
+BUILTIN_OCR_PROVIDERS: dict[str, str] = {
+    OcrProviderName.AZURE.value: "dgml_core.ocr_azure:AzureProvider",
+    OcrProviderName.AWS.value: "dgml_core.ocr_aws:AwsProvider",
+    OcrProviderName.MACOS.value: "dgml_core.ocr_macos:MacosProvider",
+}
 
 # The provider used on macOS when a workspace declares no OCR config: the
 # on-device Apple Vision engine. Off macOS there is no built-in engine, so
@@ -92,20 +131,47 @@ DEFAULT_OCR_PROVIDER = OcrProviderName.MACOS
 class OcrConfig:
     """Parsed ``ocr`` section of the workspace config.
 
-    Provider-specific fields are validated by :func:`load_ocr_config`; by
-    construction this object is well-formed for the provider it names.
+    ``provider`` is the string the config actually wrote — a short built-in name
+    or a dotted path — kept verbatim so error messages quote what the user typed.
+    ``options`` holds the section's provider-specific fields: ``endpoint`` /
+    ``api_key_env`` for Azure, ``region`` / ``profile`` for AWS, whatever a third
+    party declares. The universal keys (``provider``, ``max_concurrency``) are
+    parsed here and kept out of ``options``, so a provider's ``config_fields``
+    only ever has to name its own settings.
+
+    Provider-specific fields are validated by the provider's
+    :meth:`OcrProvider.parse_config`, which :func:`load_ocr_config` runs; by
+    construction an object that came from there is well-formed for the provider
+    it names.
     """
 
-    provider: OcrProviderName
-    # Azure
-    endpoint: str | None = None
-    api_key: str | None = None
-    api_key_env: str | None = None
-    # AWS
-    region: str | None = None
-    profile: str | None = None
+    provider: str
+    options: Mapping[str, Any] = field(default_factory=dict)
     # Universal: number of pages OCR'd concurrently (in-flight provider calls).
     max_concurrency: int = DEFAULT_OCR_CONCURRENCY
+
+
+def resolve_provider_class(provider: str) -> type[OcrProvider]:
+    """Import and return the :class:`OcrProvider` subclass named by ``provider``.
+
+    Accepts a built-in short name (resolved through :data:`BUILTIN_OCR_PROVIDERS`)
+    or a dotted ``"module.path:ClassName"``. Raises :class:`OcrConfigInvalid` —
+    i.e. the documented ``OCR_CONFIG_INVALID`` code — when the string is neither a
+    known short name nor a resolvable dotted path, or resolves to something that is
+    not an :class:`OcrProvider`.
+    """
+    dotted = BUILTIN_OCR_PROVIDERS.get(provider)
+    if dotted is None:
+        if ":" not in provider:
+            raise OcrConfigInvalid(
+                f"'ocr.provider' must be one of {sorted(BUILTIN_OCR_PROVIDERS)} or a "
+                f"dotted path 'module.path:ClassName' (got {provider!r})"
+            )
+        dotted = provider
+    cls: type[OcrProvider] = import_provider_class(
+        dotted, OcrProvider, kind="ocr", error=OcrConfigInvalid
+    )
+    return cls
 
 
 def load_ocr_config(workspace: Workspace) -> OcrConfig:
@@ -113,6 +179,13 @@ def load_ocr_config(workspace: Workspace) -> OcrConfig:
 
     Validation of provider-specific fields is delegated to each provider
     class (:meth:`OcrProvider.parse_config`) so this loader stays generic.
+
+    Unlike :func:`dgml_core.conversion.load_conversion_config`, this **does**
+    resolve the provider class and run its validation eagerly, importing a
+    third-party module here. That is deliberate: ``file add`` validates OCR config
+    before it touches the filesystem, so a bad ``[ocr]`` table is rejected with no
+    record created (see :meth:`dgml_core.files.FileStore.add`). A workspace names
+    exactly one OCR provider, so there is no fan-out cost to importing it.
 
     When the merged config has no ``ocr`` section — or an empty one: on macOS,
     defaults to the on-device provider (:data:`DEFAULT_OCR_PROVIDER`) and emits a
@@ -125,23 +198,61 @@ def load_ocr_config(workspace: Workspace) -> OcrConfig:
         # Absent or empty. Unlike `style` / `text_extraction`, this section's mere
         # presence carries no meaning — `provider` is what selects a backend — so
         # a bare `[ocr]` is the same as none at all rather than a misconfiguration.
-        return _default_ocr_config()
+        return _default_ocr_config(workspace)
     if not isinstance(ocr, dict):
         raise OcrConfigInvalid("'ocr' must be a table")
 
-    provider_str = ocr.get("provider")
-    valid_providers = [p.value for p in OcrProviderName]
-    if provider_str not in valid_providers:
+    provider = ocr.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
         raise OcrConfigInvalid(
-            f"'ocr.provider' must be one of {valid_providers} (got {provider_str!r})"
+            f"'ocr.provider' must be a non-empty string — one of "
+            f"{sorted(BUILTIN_OCR_PROVIDERS)} or a dotted path 'module.path:ClassName' "
+            f"(got {provider!r})"
         )
-    provider_name = OcrProviderName(provider_str)
-
-    cfg = _PROVIDERS[provider_name].parse_config(ocr)
-    return replace(cfg, max_concurrency=_parse_max_concurrency(ocr))
+    return _parse_section(provider, ocr)
 
 
-def _parse_max_concurrency(ocr: dict[str, Any]) -> int:
+#: Section-level keys that belong to DGML's own dispatch loop rather than to any
+#: provider. Stripped from ``options`` so a provider's ``config_fields`` never has
+#: to name them — and so adding one later cannot break a third party's validation.
+UNIVERSAL_OCR_FIELDS = frozenset({"provider", "max_concurrency"})
+
+
+def _parse_section(provider: str, section: Mapping[str, Any]) -> OcrConfig:
+    """Resolve ``provider`` and let it validate the section's provider-specific
+    fields, then attach the universal ones DGML parses itself."""
+    cls = resolve_provider_class(provider)
+    options = {k: v for k, v in section.items() if k not in UNIVERSAL_OCR_FIELDS}
+    cfg = _run_parse_config(cls, OcrConfig(provider=provider, options=options))
+    return replace(cfg, max_concurrency=_parse_max_concurrency(section))
+
+
+def _run_parse_config(cls: type[OcrProvider], config: OcrConfig) -> OcrConfig:
+    """Reject unknown option keys, run ``cls.parse_config``, and check what it gave back.
+
+    The unknown-key check runs **here** rather than only inside each provider, so
+    rejecting a user's typo is guaranteed by the framework instead of being opt-in on
+    whether a third party remembered to call it. Bundled providers still call it
+    themselves; it is idempotent, and leaving it there keeps ``parse_config`` correct
+    for anyone invoking it directly.
+
+    Validating the return matters because the failure is otherwise silent: a
+    ``parse_config`` that ends without ``return config`` yields ``None``, and the
+    provider is then constructed with ``None`` as its config — no error, just a
+    provider holding nothing.
+    """
+    cls._check_no_extra_fields(config.options)
+    parsed = cls.parse_config(config)
+    if not isinstance(parsed, OcrConfig):
+        raise OcrConfigInvalid(
+            f"{cls._describe()!r}.parse_config must return an OcrConfig, got "
+            f"{type(parsed).__name__} — a parse_config that validates but forgets to "
+            f"`return config` lands here."
+        )
+    return parsed
+
+
+def _parse_max_concurrency(ocr: Mapping[str, Any]) -> int:
     """Read the optional universal ``ocr.max_concurrency`` (a positive int),
     defaulting to :data:`DEFAULT_OCR_CONCURRENCY`."""
     raw = ocr.get("max_concurrency")
@@ -152,13 +263,14 @@ def _parse_max_concurrency(ocr: dict[str, Any]) -> int:
     return raw
 
 
-def _default_ocr_config() -> OcrConfig:
+def _default_ocr_config(workspace: Workspace) -> OcrConfig:
     """Config used when the workspace declares no OCR provider.
 
     macOS ships a built-in on-device engine (Apple Vision), so we default
-    to it — emitting a warning that we're doing so. Other platforms have no
+    to it — warning that we're doing so, once per workspace per process
+    (see :data:`_WARNED_NO_OCR_PROVIDER`). Other platforms have no
     built-in OCR, so a missing config is an error the user must fix by
-    declaring a cloud provider ('aws' or 'azure').
+    declaring a provider.
 
     Built through the default provider's own parser so it stays the single
     source of truth for that provider's required fields.
@@ -166,15 +278,20 @@ def _default_ocr_config() -> OcrConfig:
     if sys.platform != "darwin":
         raise OcrConfigMissing(
             "no OCR provider configured: add an 'ocr' section to config.toml "
-            "with provider 'aws' or 'azure' (on-device OCR is only available "
-            "on macOS)"
+            "with provider 'aws' or 'azure' — or your own 'module.path:ClassName' "
+            "(on-device OCR is only available on macOS)"
         )
-    warnings.warn(
-        "no OCR provider configured; defaulting to the on-device macOS provider "
-        "(Apple Vision). Set ocr.provider in config.toml to silence this warning.",
-        stacklevel=2,
-    )
-    return _PROVIDERS[DEFAULT_OCR_PROVIDER].parse_config({"provider": DEFAULT_OCR_PROVIDER.value})
+    if workspace.root not in _WARNED_NO_OCR_PROVIDER:
+        _WARNED_NO_OCR_PROVIDER.add(workspace.root)
+        # Names the workspace because the dedup is per workspace: a process
+        # holding several must be able to tell the resulting lines apart.
+        logger.warning(
+            "no OCR provider configured for workspace (%s); defaulting to the "
+            "on-device macOS provider (Apple Vision). Set ocr.provider in "
+            "config.toml to silence this warning.",
+            workspace.root,
+        )
+    return _parse_section(DEFAULT_OCR_PROVIDER.value, {})
 
 
 # ---------------------------------------------------------------------------
@@ -214,8 +331,8 @@ def _as_page_result(ret: list[dict[str, Any]] | OcrPageResult) -> OcrPageResult:
     return OcrPageResult(words=ret, angle=0.0)
 
 
-class OcrProvider(ABC):
-    """Common interface for cloud OCR backends.
+class OcrProvider(ProviderConfigFields, ABC):
+    """Common interface for OCR backends.
 
     Implementations are constructed from an :class:`OcrConfig` (which is
     where lazy SDK imports and auth setup live) and implement
@@ -224,38 +341,36 @@ class OcrProvider(ABC):
     JSON output, and result aggregation — providers only need to turn
     image bytes into a list of words.
 
-    Subclasses must declare ``config_fields`` listing the JSON keys they
-    accept under ``ocr.*`` (besides the universal ``provider`` key);
-    anything else is rejected by :meth:`_check_no_extra_fields` to catch
-    typos and stale-after-switching-provider fields.
+    Subclasses must declare ``config_fields`` listing the keys they accept
+    under ``ocr.*`` (besides the universal keys in
+    :data:`UNIVERSAL_OCR_FIELDS`, which never reach a provider); anything else
+    is rejected by
+    :meth:`~dgml_core.provider.ProviderConfigFields._check_no_extra_fields`
+    to catch typos and stale-after-switching-provider fields. That machinery
+    is shared with the ``[storage]`` and ``[workspaces]`` providers; the two
+    ClassVars below bind it to this section so failures carry the ``ocr``
+    vocabulary and the ``OCR_CONFIG_INVALID`` code.
+
+    ``name`` is the provider's short name for failure messages. For the
+    bundled providers it is the :class:`OcrProviderName` alias; a third
+    party's can be any short identifier.
     """
 
-    name: ClassVar[OcrProviderName]
     config_fields: ClassVar[frozenset[str]]
-
-    @classmethod
-    def _check_no_extra_fields(cls, section: dict[str, Any]) -> None:
-        """Raise :class:`OcrConfigInvalid` for any keys in ``section`` not
-        in ``cls.config_fields`` (or the universal ``provider``)."""
-        allowed = cls.config_fields | {"provider", "max_concurrency"}
-        unknown = set(section.keys()) - allowed
-        if unknown:
-            raise OcrConfigInvalid(
-                f"unknown fields in 'ocr' for provider {cls.name.value!r}: "
-                f"{sorted(unknown)}. Allowed: {sorted(allowed)}"
-            )
+    config_section: ClassVar[str] = "ocr"
+    config_error: ClassVar[type[DgmlError]] = OcrConfigInvalid
 
     @classmethod
     @abstractmethod
-    def parse_config(cls, section: dict[str, Any]) -> OcrConfig:
-        """Build an :class:`OcrConfig` from the ``ocr`` section of the
-        workspace config (a plain JSON dict).
+    def parse_config(cls, config: OcrConfig) -> OcrConfig:
+        """Validate the provider's option fields and return the (possibly
+        normalized) config.
 
-        Implementations should call :meth:`_check_no_extra_fields` first
-        to reject foreign or misspelled keys, then validate the provider's
-        own fields. Raise :class:`OcrConfigInvalid` for missing or
-        malformed fields. The returned config must have ``provider`` set
-        to ``cls.name``.
+        ``config.options`` is the ``ocr`` section minus the universal keys
+        (:data:`UNIVERSAL_OCR_FIELDS`).
+        Implementations should call :meth:`_check_no_extra_fields` on it first
+        to reject foreign or misspelled keys, then validate the provider's own
+        fields, raising :class:`OcrConfigInvalid` for missing or malformed ones.
         """
 
     @abstractmethod
@@ -292,12 +407,16 @@ class OcrProvider(ABC):
         """
 
 
-def make_provider(config: OcrConfig) -> OcrProvider:
-    """Instantiate the provider class for ``config.provider``."""
-    cls = _PROVIDERS.get(config.provider)
-    if cls is None:  # defensive — load_ocr_config validates already
-        raise OcrConfigInvalid(f"no provider implementation for {config.provider!r}")
-    return cls(config)
+def make_ocr_provider(config: OcrConfig) -> OcrProvider:
+    """Instantiate the :class:`OcrProvider` named by ``config`` (resolve provider →
+    ``parse_config`` → construct, where the provider's lazy SDK import happens).
+
+    Re-runs ``parse_config`` rather than trusting the caller: it is what validates a
+    config built by hand (a library consumer, a test), and for one that came from
+    :func:`load_ocr_config` it is a no-op — which is why ``parse_config`` is required
+    to be pure and idempotent."""
+    cls = resolve_provider_class(config.provider)
+    return cls(_run_parse_config(cls, config))
 
 
 def extract_text_ocr(
@@ -343,7 +462,7 @@ def extract_text_ocr(
     Raises :class:`OcrFailed` for provider/API errors, :class:`AuthError`
     for credential resolution failures.
     """
-    provider = make_provider(config)
+    provider = make_ocr_provider(config)
     workers = config.max_concurrency if max_concurrency is None else max_concurrency
 
     page_image_paths = sorted(page_images_dir.glob(PAGE_GLOB))
@@ -480,45 +599,8 @@ def _write_page_json(
     )
 
 
-# ---------------------------------------------------------------------------
-# Provider registry
-#
-# Built at module load by a function call so the provider modules' imports
-# of this module see a fully-defined OcrProvider ABC and OcrConfig dataclass.
-# Doing the import here (rather than at the top of the file) avoids a
-# circular dependency: ocr_aws / ocr_azure import OcrProvider from us.
-# ---------------------------------------------------------------------------
-
-
-def _register_providers(
-    classes: list[type[OcrProvider]],
-) -> dict[OcrProviderName, type[OcrProvider]]:
-    """Build a name-keyed registry from a list of provider classes.
-
-    Iterating a list (rather than constructing a dict literal) lets us
-    detect collisions: two providers claiming the same
-    :class:`OcrProviderName` is a copy-paste bug that would otherwise
-    silently overwrite. Raising here keeps the failure at import time,
-    before any OCR call.
-    """
-    registry: dict[OcrProviderName, type[OcrProvider]] = {}
-    for cls in classes:
-        if cls.name in registry:
-            existing = registry[cls.name].__name__
-            raise RuntimeError(
-                f"duplicate OcrProvider registration for {cls.name.value!r}: "
-                f"{existing} and {cls.__name__}"
-            )
-        registry[cls.name] = cls
-    return registry
-
-
-def _build_registry() -> dict[OcrProviderName, type[OcrProvider]]:
-    from .ocr_aws import AwsProvider
-    from .ocr_azure import AzureProvider
-    from .ocr_macos import MacosProvider
-
-    return _register_providers([AzureProvider, AwsProvider, MacosProvider])
-
-
-_PROVIDERS: dict[OcrProviderName, type[OcrProvider]] = _build_registry()
+# No provider registry lives here any more. Classes are resolved by dotted path
+# at use time (:func:`resolve_provider_class`), which is what lets a third party
+# name their own — and it also removes the import cycle the old import-time
+# registry had to work around, since ocr_aws / ocr_azure / ocr_macos import this
+# module rather than the other way round.

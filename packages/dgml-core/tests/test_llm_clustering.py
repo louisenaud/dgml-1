@@ -23,7 +23,7 @@ its integration through :func:`dgml_core.clustering.clustering_internal` /
 from __future__ import annotations
 
 import json
-import warnings
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -733,7 +733,7 @@ def test_default_method_leaves_a_large_corpus_on_the_embedding_path(
 
 
 def test_auto_falls_back_to_embedding_without_classification_config(
-    workspace: Workspace,
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A workspace with no `classification` section must still cluster.
 
@@ -753,9 +753,9 @@ def test_auto_falls_back_to_embedding_without_classification_config(
     ) as run_embedding:
         # Silent on purpose: a workspace that never configured a model is not
         # LLM-enabled, and saying so on every small run would be noise.
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", RuntimeWarning)
+        with caplog.at_level(logging.WARNING, logger="dgml_core.clustering"):
             internal = clustering_internal(workspace, method="auto")
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     assert internal.method == "embedding"
     assert run_embedding.call_count == 1
@@ -852,7 +852,7 @@ def _prediction(cluster_name: str) -> Any:
 
 
 def test_auto_routes_around_a_malformed_classification_section_but_says_so(
-    workspace: Workspace,
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
 ) -> None:
     """ "Configured wrong" must neither break the run nor pass unmentioned.
 
@@ -870,8 +870,9 @@ def test_auto_routes_around_a_malformed_classification_section_but_says_so(
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"a": _prediction("unknown_0"), "b": _prediction("unknown_0")},
     ) as run_embedding:
-        with pytest.warns(RuntimeWarning, match="cannot be used"):
+        with caplog.at_level(logging.WARNING, logger="dgml_core.clustering"):
             internal = clustering_internal(workspace, method="auto")
+    assert "cannot be used" in caplog.text
 
     assert internal.method == "embedding"
     assert run_embedding.call_count == 1
@@ -957,7 +958,9 @@ def test_auto_validates_the_config_before_routing(workspace: Workspace) -> None:
     assert completion.call_count == 0
 
 
-def test_auto_falls_back_when_the_credential_is_missing(workspace: Workspace) -> None:
+def test_auto_falls_back_when_the_credential_is_missing(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
     """A configured model with no key behind it must not break the no-raise contract.
 
     `classification.api_key_env` naming an unset variable raises `AuthError`
@@ -974,8 +977,9 @@ def test_auto_falls_back_when_the_credential_is_missing(workspace: Workspace) ->
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"a": _prediction("unknown_0"), "b": _prediction("unknown_0")},
     ) as run_embedding:
-        with pytest.warns(RuntimeWarning, match="cannot be used"):
+        with caplog.at_level(logging.WARNING, logger="dgml_core.clustering"):
             internal = clustering_internal(workspace, method="auto")
+    assert "cannot be used" in caplog.text
 
     assert internal.method == "embedding"
     assert run_embedding.call_count == 1
