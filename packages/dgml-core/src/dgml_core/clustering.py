@@ -42,8 +42,8 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import tempfile
-import warnings
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -78,6 +78,8 @@ from .models_config import ConfigSection
 from .run_clustering import resolve_text_settings, resolve_text_view, run_clustering_detailed
 from .storage import Workspace, read_json
 from .utils import unassigned_file_ids
+
+logger = logging.getLogger(__name__)
 
 # Cap on how many files from a single cluster get sent to the LLM when
 # naming a new DocSet. Each contributes up to ``config.max_pages`` page
@@ -915,13 +917,11 @@ def _llm_partitioner_usable(workspace: Workspace) -> bool:
     except ClassificationConfigMissing:
         return False
     except DgmlError as exc:
-        warnings.warn(
+        logger.warning(
             "clustering: the configured classification model cannot be used "
             f"({exc}). This run grouped the files with the embedding pipeline "
             "instead. Fix the 'classification' config, or pass --method llm to "
-            "make this an error rather than a fallback.",
-            RuntimeWarning,
-            stacklevel=2,
+            "make this an error rather than a fallback."
         )
         return False
     return True

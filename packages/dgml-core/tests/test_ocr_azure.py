@@ -107,8 +107,10 @@ def test_azure_missing_env_var_raises_auth_error(
     (pages_dir / "page_1.png").write_bytes(make_fake_png(100, 100))
     cfg = OcrConfig(
         provider=OcrProviderName.AZURE,
-        endpoint="https://example.cognitiveservices.azure.com/",
-        api_key_env="TEST_AZURE_KEY",
+        options={
+            "endpoint": "https://example.cognitiveservices.azure.com/",
+            "api_key_env": "TEST_AZURE_KEY",
+        },
     )
     with pytest.raises(AuthError, match="TEST_AZURE_KEY"):
         extract_text_ocr(
@@ -129,8 +131,10 @@ def test_azure_literal_api_key_builds_key_credential(monkeypatch: pytest.MonkeyP
     monkeypatch.delenv("ANY_KEY_ENV", raising=False)
     cfg = OcrConfig(
         provider=OcrProviderName.AZURE,
-        endpoint="https://example.cognitiveservices.azure.com/",
-        api_key="literal-key-value",
+        options={
+            "endpoint": "https://example.cognitiveservices.azure.com/",
+            "api_key": "literal-key-value",
+        },
     )
     cred = _azure_credential(cfg)
     # AzureKeyCredential exposes .key.
@@ -152,8 +156,10 @@ def test_azure_missing_sdk_raises_missing_extra(
     monkeypatch.setenv("TEST_AZURE_KEY", "fake-key")
     cfg = OcrConfig(
         provider=OcrProviderName.AZURE,
-        endpoint="https://example.cognitiveservices.azure.com/",
-        api_key_env="TEST_AZURE_KEY",
+        options={
+            "endpoint": "https://example.cognitiveservices.azure.com/",
+            "api_key_env": "TEST_AZURE_KEY",
+        },
     )
     with pytest.raises(MissingExtra, match="pip install dgml\\[azure\\]") as caught:
         extract_text_ocr(
@@ -216,8 +222,10 @@ def test_azure_extract_writes_per_page_json(
     out_dir = tmp_path / "page_text"
     cfg = OcrConfig(
         provider=OcrProviderName.AZURE,
-        endpoint="https://example.cognitiveservices.azure.com/",
-        api_key_env="TEST_AZURE_KEY",
+        options={
+            "endpoint": "https://example.cognitiveservices.azure.com/",
+            "api_key_env": "TEST_AZURE_KEY",
+        },
     )
     result = extract_text_ocr(
         text_pdf,
@@ -282,8 +290,10 @@ def test_azure_rejects_unexpected_unit(
 
     cfg = OcrConfig(
         provider=OcrProviderName.AZURE,
-        endpoint="https://example.cognitiveservices.azure.com/",
-        api_key_env="TEST_AZURE_KEY",
+        options={
+            "endpoint": "https://example.cognitiveservices.azure.com/",
+            "api_key_env": "TEST_AZURE_KEY",
+        },
     )
     with pytest.raises(OcrFailed, match="unexpected unit"):
         extract_text_ocr(
@@ -324,8 +334,10 @@ def test_azure_client_built_with_timeouts_and_retry(
 
     cfg = OcrConfig(
         provider=OcrProviderName.AZURE,
-        endpoint="https://example.cognitiveservices.azure.com/",
-        api_key_env="TEST_AZURE_KEY",
+        options={
+            "endpoint": "https://example.cognitiveservices.azure.com/",
+            "api_key_env": "TEST_AZURE_KEY",
+        },
     )
     extract_text_ocr(
         text_pdf, tmp_path / "page_text", file_id="fid", page_images_dir=pages_dir, config=cfg
@@ -345,8 +357,10 @@ def test_azure_extract_requires_page_images(
     monkeypatch.setenv("TEST_AZURE_KEY", "fake-key")
     cfg = OcrConfig(
         provider=OcrProviderName.AZURE,
-        endpoint="https://example.cognitiveservices.azure.com/",
-        api_key_env="TEST_AZURE_KEY",
+        options={
+            "endpoint": "https://example.cognitiveservices.azure.com/",
+            "api_key_env": "TEST_AZURE_KEY",
+        },
     )
     with pytest.raises(OcrFailed, match="no page images"):
         extract_text_ocr(
@@ -394,8 +408,10 @@ def test_azure_significant_angle_deskews_page(
     out_dir = tmp_path / "page_text"
     cfg = OcrConfig(
         provider=OcrProviderName.AZURE,
-        endpoint="https://example.cognitiveservices.azure.com/",
-        api_key_env="TEST_AZURE_KEY",
+        options={
+            "endpoint": "https://example.cognitiveservices.azure.com/",
+            "api_key_env": "TEST_AZURE_KEY",
+        },
     )
     extract_text_ocr(text_pdf, out_dir, file_id="fid", page_images_dir=pages_dir, config=cfg)
 
@@ -445,8 +461,10 @@ def test_azure_small_angle_leaves_page_untouched(
     out_dir = tmp_path / "page_text"
     cfg = OcrConfig(
         provider=OcrProviderName.AZURE,
-        endpoint="https://example.cognitiveservices.azure.com/",
-        api_key_env="TEST_AZURE_KEY",
+        options={
+            "endpoint": "https://example.cognitiveservices.azure.com/",
+            "api_key_env": "TEST_AZURE_KEY",
+        },
     )
     extract_text_ocr(text_pdf, out_dir, file_id="fid", page_images_dir=pages_dir, config=cfg)
 

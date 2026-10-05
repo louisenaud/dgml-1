@@ -21,12 +21,18 @@ Rendering must correct two PDFium behaviours to stay interchangeable with
 ghostscript — it sizes canvases from the CropBox, and rounds up in float —
 see :meth:`Pypdfium2Renderer._render_page`. Slicing needs no such correction:
 ``import_pages`` copies page objects structurally, preserving the text layer.
+
+PDFium is not thread-safe (per pypdfium2's docs: no concurrent calls, even on
+different documents), so :data:`_PDFIUM_LOCK` serializes every engine call and
+callers may thread freely. Ghostscript needs no such lock — each call is its
+own subprocess.
 """
 
 from __future__ import annotations
 
 import io
 import math
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -42,6 +48,9 @@ from .pages import (
 
 # PDF user space is 72 points per inch; PDFium takes a scale factor, not a dpi.
 _PDF_POINTS_PER_INCH = 72.0
+
+# One lock per process, not per document: PDFium's constraint is global.
+_PDFIUM_LOCK = threading.Lock()
 
 
 def _has_area(box: tuple[float, float, float, float] | None) -> bool:
@@ -99,34 +108,36 @@ class Pypdfium2Renderer(PageRenderer):
 
     def render(self, pdf_path: Path, output_dir: Path, *, dpi: int) -> None:
         scale = dpi / _PDF_POINTS_PER_INCH
-        try:
-            pdf = self._pdfium.PdfDocument(str(pdf_path))
-        except Exception as exc:  # PdfiumError, or OSError on unreadable input
-            raise PageRenderFailed(f"pypdfium2 could not open {pdf_path.name}: {exc}") from exc
-        true_page_count: int | None = None
-        try:
-            for index in range(len(pdf)):
-                page_num = index + 1
-                try:
-                    self._render_page(pdf[index], output_dir, page_num, dpi=dpi, scale=scale)
-                except Exception as exc:
-                    # PDFium's page count comes from the catalog's ``/Count``,
-                    # which ``pdf_page_count`` deliberately distrusts (it walks
-                    # the page tree instead). A failure here may simply be that
-                    # ``/Count`` overstated reality and we have run past the
-                    # last real page — where ghostscript renders the pages that
-                    # do exist rather than failing the document. Consult the
-                    # authoritative count only now, so a well-formed PDF never
-                    # pays for the extra parse.
-                    if true_page_count is None:
-                        true_page_count = _true_page_count(pdf_path, fallback=len(pdf))
-                    if page_num > true_page_count:
-                        break
-                    raise PageRenderFailed(
-                        f"pypdfium2 failed rendering page {page_num} of {pdf_path.name}: {exc}"
-                    ) from exc
-        finally:
-            pdf.close()
+        # Held across open → render → close: those are all pdfium calls.
+        with _PDFIUM_LOCK:
+            try:
+                pdf = self._pdfium.PdfDocument(str(pdf_path))
+            except Exception as exc:  # PdfiumError, or OSError on unreadable input
+                raise PageRenderFailed(f"pypdfium2 could not open {pdf_path.name}: {exc}") from exc
+            true_page_count: int | None = None
+            try:
+                for index in range(len(pdf)):
+                    page_num = index + 1
+                    try:
+                        self._render_page(pdf[index], output_dir, page_num, dpi=dpi, scale=scale)
+                    except Exception as exc:
+                        # PDFium's page count comes from the catalog's ``/Count``,
+                        # which ``pdf_page_count`` deliberately distrusts (it walks
+                        # the page tree instead). A failure here may simply be that
+                        # ``/Count`` overstated reality and we have run past the
+                        # last real page — where ghostscript renders the pages that
+                        # do exist rather than failing the document. Consult the
+                        # authoritative count only now, so a well-formed PDF never
+                        # pays for the extra parse.
+                        if true_page_count is None:
+                            true_page_count = _true_page_count(pdf_path, fallback=len(pdf))
+                        if page_num > true_page_count:
+                            break
+                        raise PageRenderFailed(
+                            f"pypdfium2 failed rendering page {page_num} of {pdf_path.name}: {exc}"
+                        ) from exc
+            finally:
+                pdf.close()
 
     def _render_page(
         self, page: Any, output_dir: Path, page_num: int, *, dpi: int, scale: float
@@ -187,26 +198,30 @@ class Pypdfium2Slicer(PdfSlicer):
         self._pdfium = _import_pdfium()
 
     def slice(self, pdf_bytes: bytes, page_numbers: Sequence[int]) -> bytes:
-        try:
-            source = self._pdfium.PdfDocument(pdf_bytes)
-        except Exception as exc:
-            raise PdfSliceFailed(f"pypdfium2 could not open the PDF to slice: {exc}") from exc
-        out = io.BytesIO()
-        try:
-            new = self._pdfium.PdfDocument.new()
+        # Held across open → import_pages → save → close: all pdfium calls.
+        # Generation slices concurrently (one thread per document), so this
+        # lock is what makes the engine safe to call from that pool.
+        with _PDFIUM_LOCK:
             try:
-                # import_pages takes 0-based indices; page_numbers are 1-based
-                # and already bounds-checked and ordered by slice_pages().
-                new.import_pages(source, [n - 1 for n in page_numbers])
-                new.save(out)
+                source = self._pdfium.PdfDocument(pdf_bytes)
+            except Exception as exc:
+                raise PdfSliceFailed(f"pypdfium2 could not open the PDF to slice: {exc}") from exc
+            out = io.BytesIO()
+            try:
+                new = self._pdfium.PdfDocument.new()
+                try:
+                    # import_pages takes 0-based indices; page_numbers are 1-based
+                    # and already bounds-checked and ordered by slice_pages().
+                    new.import_pages(source, [n - 1 for n in page_numbers])
+                    new.save(out)
+                finally:
+                    new.close()
+            except PdfSliceFailed:
+                raise
+            except Exception as exc:
+                raise PdfSliceFailed(
+                    f"pypdfium2 failed slicing pages {list(page_numbers)}: {exc}"
+                ) from exc
             finally:
-                new.close()
-        except PdfSliceFailed:
-            raise
-        except Exception as exc:
-            raise PdfSliceFailed(
-                f"pypdfium2 failed slicing pages {list(page_numbers)}: {exc}"
-            ) from exc
-        finally:
-            source.close()
+                source.close()
         return out.getvalue()

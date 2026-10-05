@@ -40,6 +40,11 @@ Coordinate space contract:
   and what the ``get_page_words`` tool hands the model. The model reads
   pixel word boxes and returns pixel bboxes, so every hop speaks one
   language with no conversion.
+- The one exception is phase 3 on a page with no OCR words (a scan added
+  in digital mode): with no pixel words to measure against, the model is
+  asked for boxes on a 0-1000 grid over the page image, and
+  :func:`_to_page_pixels` scales them to pixels before they are stored.
+  What is stored is always pixels.
 """
 
 from __future__ import annotations
@@ -48,6 +53,7 @@ import base64
 import copy
 import json
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -72,6 +78,7 @@ from .extraction_schema import (
     FIELD_DATATYPES,
     Tag,
     Vocabulary,
+    check_invariant_paths,
     field_tree_to_rnc,
     parse_rnc,
     rnc_to_json_schema,
@@ -102,6 +109,7 @@ from .matching import (
     walk_computed_leaves,
 )
 from .models_config import ConfigSection, Tier, resolve_tiered_model
+from .ocr import _image_dimensions as _png_dimensions
 from .prompts import PromptKey
 from .prompts import get as prompt
 from .storage import Workspace
@@ -161,9 +169,26 @@ _DEFAULT_REASONING_EFFORT = "high"
 # _DEFAULT_REASONING_EFFORT. Schema generation and location grounding force
 # ``tool_choice``, so the LLM wrapper drops ``reasoning_effort`` for
 # Anthropic-routed models and the value would be inert there on Claude — but it
-# is NOT dropped for other providers, and lowering their budget was not
-# measured. Only phase 1 uses auto tool choice, so only phase 1 changes.
+# is NOT dropped for other providers. Location grounding on pages with OCR words
+# keeps the default; see _PHASE3_GRID_REASONING_EFFORT for pages without them.
 _VALUES_REASONING_EFFORT = "medium"
+
+# What ``grounded.values_reasoning_effort`` (and ``--values-effort``) accept: the
+# effort names litellm takes, sent as given, plus ``"default"``, which sends no
+# ``reasoning_effort`` at all and leaves the budget to the provider. ``"none"``
+# is litellm's own value and is sent (it asks the provider to turn thinking
+# off), which is why omitting the field needs a word of its own.
+VALUES_REASONING_EFFORT_CHOICES = ("none", "minimal", "low", "medium", "high", "xhigh")
+VALUES_REASONING_EFFORT_PROVIDER_DEFAULT = "default"
+
+# Location grounding on a page with no OCR words (the 0-1000 grid path) runs at
+# "medium". There the model only reads a position off the image; at "high" it
+# spent most of its output reasoning without placing boxes any better. Measured
+# on Gemini over 30 records-retrieval documents, most of them scans, 3 repeats:
+# "medium" placed as many boxes on scanned pages as "high", for about half the
+# grounding cost; "low" was cheaper again but started to miss boxes. Pages with
+# words keep the default, which that measurement did not cover.
+_PHASE3_GRID_REASONING_EFFORT = "medium"
 
 
 # HTTP timeout for a single litellm call. The default in litellm is
@@ -220,6 +245,26 @@ class GroundedConfig:
     schema_api_base: str | None = None
     values_api_base: str | None = None
     max_tool_iters: int = DEFAULT_MAX_TOOL_ITERS
+    # Reasoning budget of the value-extraction call (phase 1). ``None`` sends no
+    # ``reasoning_effort``; location grounding keeps its own constants.
+    values_reasoning_effort: str | None = _VALUES_REASONING_EFFORT
+
+
+def parse_values_reasoning_effort(raw: Any, *, source: str) -> str | None:
+    """Validate a values reasoning effort from the config file or the CLI.
+
+    Returns the effort to send, or ``None`` for ``"default"`` (send nothing).
+    ``source`` names where the value came from, for the error message.
+    """
+    if raw == VALUES_REASONING_EFFORT_PROVIDER_DEFAULT:
+        return None
+    if isinstance(raw, str) and raw in VALUES_REASONING_EFFORT_CHOICES:
+        return raw
+    accepted = ", ".join(
+        repr(v)
+        for v in (*VALUES_REASONING_EFFORT_CHOICES, VALUES_REASONING_EFFORT_PROVIDER_DEFAULT)
+    )
+    raise GroundedConfigInvalid(f"{source} must be one of {accepted} if set (got {raw!r})")
 
 
 def load_grounded_config(workspace: Workspace) -> GroundedConfig:
@@ -260,6 +305,13 @@ def load_grounded_config(workspace: Workspace) -> GroundedConfig:
         or max_tool_iters_raw < 1
     ):
         raise GroundedConfigInvalid("'grounded.max_tool_iters' must be a positive integer if set")
+    values_reasoning_effort = (
+        parse_values_reasoning_effort(
+            sec["values_reasoning_effort"], source="'grounded.values_reasoning_effort'"
+        )
+        if "values_reasoning_effort" in sec
+        else _VALUES_REASONING_EFFORT
+    )
 
     return GroundedConfig(
         schema_model=schema.model,
@@ -271,6 +323,7 @@ def load_grounded_config(workspace: Workspace) -> GroundedConfig:
         schema_api_base=schema.api_base,
         values_api_base=values.api_base,
         max_tool_iters=max_tool_iters_raw,
+        values_reasoning_effort=values_reasoning_effort,
     )
 
 
@@ -334,35 +387,41 @@ def get_page_words(
 def _pdf_bytes(workspace: Workspace, file_id: str) -> bytes:
     """Return the bytes of the single ``*.pdf`` stored for ``file_id``.
 
+    The PDF is found by the name ``file add`` stored it under
+    (:func:`layout.file_pdf_key`, from the record's ``original_filename``),
+    not by matching a suffix: a source named ``INVOICE.PDF`` is stored under
+    that name, so a case-sensitive ``.pdf`` match missed it. There is no
+    fallback scan: a filename is not unique in the workspace, so a PDF found
+    anywhere else under the prefix could belong to another source.
+
     A convertible source whose conversion failed at ``file add`` has a
     record but no PDF, and the converter's error is among the file's
     recorded errors: such a file raises :class:`ConversionFailed` repeating
     that error. A file with no PDF and no recorded conversion error raises
     :class:`FileNotFound` as before.
     """
-    keys = workspace.blobs.list_blobs(layout.file_prefix(file_id))
-    pdfs = [k for k in keys if k.endswith(".pdf")]
-    if not pdfs:
-        try:
-            failed = [
-                err.message.strip()
-                for err in load_recorded_errors(workspace, file_id)
-                if err.operation == CONVERT_TO_PDF_OPERATION
-                and isinstance(err.message, str)
-                and err.message.strip()
-            ]
-        except (TypeError, KeyError, ValueError, AttributeError):
-            # The lookup is a diagnostic: a malformed errors document (a
-            # wrong shape, a missing field) must not turn the missing PDF
-            # into an internal error; a record without a usable message is
-            # skipped the same way.
-            failed = []
-        if failed:
-            raise ConversionFailed(
-                f"file '{file_id}' has no source PDF: converting it failed: {failed[-1]}"
-            )
-        raise FileNotFound(f"file '{file_id}' has no source PDF")
-    return workspace.blobs.get_blob(pdfs[0])
+    pdf_key = layout.file_pdf_key(file_id, FileStore(workspace).get(file_id).original_filename)
+    if workspace.blobs.blob_exists(pdf_key):
+        return workspace.blobs.get_blob(pdf_key)
+    try:
+        failed = [
+            err.message.strip()
+            for err in load_recorded_errors(workspace, file_id)
+            if err.operation == CONVERT_TO_PDF_OPERATION
+            and isinstance(err.message, str)
+            and err.message.strip()
+        ]
+    except (TypeError, KeyError, ValueError, AttributeError):
+        # The lookup is a diagnostic: a malformed errors document (a
+        # wrong shape, a missing field) must not turn the missing PDF
+        # into an internal error; a record without a usable message is
+        # skipped the same way.
+        failed = []
+    if failed:
+        raise ConversionFailed(
+            f"file '{file_id}' has no source PDF: converting it failed: {failed[-1]}"
+        )
+    raise FileNotFound(f"file '{file_id}' has no source PDF")
 
 
 def _pdf_content_block(pdf_bytes: bytes) -> dict[str, Any]:
@@ -640,7 +699,8 @@ def extract_values(
     """
     store = DocSetStore(workspace)
     rnc_schema = store.get_schema(docset_id)  # RNC text; raises SchemaNotFound
-    vocab = parse_rnc(rnc_schema)
+    # A stored schema is not re-checked on read; here it is about to be used.
+    vocab = check_invariant_paths(parse_rnc(rnc_schema))
     schema = rnc_to_json_schema(rnc_schema)
     guidance = store.get_guidance(docset_id) if store.has_guidance(docset_id) else None
     pdf_bytes = _pdf_bytes(workspace, file_id)
@@ -660,6 +720,8 @@ def extract_values(
     phase2_duration = 0.0
     phase3_duration = 0.0
     phase3_page_calls = 0
+    phase3_grid_pages = 0
+    phase3_boxes_dropped = 0
     phase3_pages_out_of_range = 0
     phase2_matched = 0
     phase3_matched = 0
@@ -749,6 +811,7 @@ def extract_values(
                     api_base=api_base,
                     max_tool_iters=config.max_tool_iters,
                     totals=phase1_totals,
+                    reasoning_effort=config.values_reasoning_effort,
                 )
                 break
             except _OutputTruncated as exc:
@@ -820,7 +883,13 @@ def extract_values(
             page_count=FileStore(workspace).get(file_id).page_count,
         )
         if unmatched:
-            final_values, phase3_matched, phase3_page_calls = _run_phase3(
+            (
+                final_values,
+                phase3_matched,
+                phase3_page_calls,
+                phase3_grid_pages,
+                phase3_boxes_dropped,
+            ) = _run_phase3(
                 workspace=workspace,
                 file_id=file_id,
                 values=final_values,
@@ -915,6 +984,8 @@ def extract_values(
                     phase2_duration=phase2_duration,
                     phase3_duration=phase3_duration,
                     phase3_page_calls=phase3_page_calls,
+                    phase3_grid_pages=phase3_grid_pages,
+                    phase3_boxes_dropped=phase3_boxes_dropped,
                     phase3_pages_out_of_range=phase3_pages_out_of_range,
                     phase2_matched=phase2_matched,
                     phase3_matched=phase3_matched,
@@ -980,6 +1051,8 @@ def _write_extraction_stats(
     phase2_duration: float,
     phase3_duration: float,
     phase3_page_calls: int,
+    phase3_grid_pages: int,
+    phase3_boxes_dropped: int,
     phase3_pages_out_of_range: int,
     phase2_matched: int,
     phase3_matched: int,
@@ -1024,6 +1097,11 @@ def _write_extraction_stats(
             "phase3": {
                 "duration_s": phase3_duration,
                 "page_calls": phase3_page_calls,
+                # pages with no OCR words, located on the 0-1000 grid, and
+                # returned boxes dropped as empty or off the page (their
+                # items stay unmatched).
+                "grid_pages": phase3_grid_pages,
+                "boxes_dropped": phase3_boxes_dropped,
                 # pages phase 1 cited that the file does not have (outside
                 # 1..page_count, no page image); their items stay unmatched
                 # and no call is made for them.
@@ -1112,7 +1190,7 @@ def _run_phase3(
     api_base: str | None,
     max_tool_iters: int,
     totals: dict[str, Any],
-) -> tuple[dict[str, Any], int, int]:
+) -> tuple[dict[str, Any], int, int, int, int]:
     """Resolve ``unmatched`` items via one LLM call per page, run in
     parallel across pages.
 
@@ -1130,7 +1208,9 @@ def _run_phase3(
     merge them after all calls return, keeping the cost telemetry
     accurate without needing a lock on the hot path.
 
-    Returns ``(values, matched_count, page_calls)``.
+    Returns ``(values, matched_count, page_calls, grid_pages, boxes_dropped)``:
+    ``grid_pages`` counts pages located on the 0-1000 grid (no OCR words), and
+    ``boxes_dropped`` the returned boxes discarded as off the page or empty.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1140,9 +1220,9 @@ def _run_phase3(
 
     def _do_page(
         page: int, items: list[UnmatchedItem]
-    ) -> tuple[int, list[UnmatchedItem], dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    ) -> tuple[int, list[UnmatchedItem], _Phase3PageResult, dict[str, Any]]:
         local_totals = _empty_totals()
-        page_results = _phase3_call_for_page(
+        page_result = _phase3_call_for_page(
             workspace=workspace,
             file_id=file_id,
             page_number=page,
@@ -1154,7 +1234,7 @@ def _run_phase3(
             max_tool_iters=max_tool_iters,
             totals=local_totals,
         )
-        return page, items, page_results, local_totals
+        return page, items, page_result, local_totals
 
     workers = min(_PHASE3_MAX_PARALLEL, max(1, len(by_page)))
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -1162,16 +1242,30 @@ def _run_phase3(
 
     matched_count = 0
     page_calls = 0
-    for _page, items, page_results, local_totals in per_page:
+    grid_pages = 0
+    boxes_dropped = 0
+    for _page, items, page_result, local_totals in per_page:
         page_calls += 1
+        grid_pages += page_result.grid
+        boxes_dropped += page_result.boxes_dropped
         add_partial(totals, local_totals)
         for item in items:
-            model_locs = page_results.get(item.id)
+            model_locs = page_result.locations.get(item.id)
             if not model_locs:
                 continue
             if _patch_value_with_locations(values, item, model_locs):
                 matched_count += 1
-    return values, matched_count, page_calls
+    return values, matched_count, page_calls, grid_pages, boxes_dropped
+
+
+@dataclass(frozen=True)
+class _Phase3PageResult:
+    """One page's phase-3 answer: ``{id -> locations}`` in page pixels, whether
+    the page went through the 0-1000 grid, and how many boxes were dropped."""
+
+    locations: dict[str, list[dict[str, Any]]]
+    grid: bool
+    boxes_dropped: int
 
 
 def _phase3_call_for_page(
@@ -1186,10 +1280,10 @@ def _phase3_call_for_page(
     api_base: str | None,
     max_tool_iters: int,
     totals: dict[str, Any],
-) -> dict[str, list[dict[str, Any]]]:
+) -> _Phase3PageResult:
     """One litellm call: send the page + ids that need locating, return
     ``{id: [{page_number, bounding_box}, ...]}`` parsed from the model's
-    ``submit_locations`` tool call.
+    ``submit_locations`` tool call, with the page's grid/dropped counts.
 
     Deliberately uncached, for three independent reasons: the cacheable prefix
     is tools + system and ``_submit_locations_tool`` is built from *this page's*
@@ -1210,19 +1304,32 @@ def _phase3_call_for_page(
     except FileNotFound:
         page_words = {"page": page_number, "total_words": 0, "words": []}
 
+    image_bytes = workspace.blobs.get_blob(image_key)
+    image_size = _page_pixel_size(workspace, file_id, page_number, image_bytes)
+    # A page with no words (a scan added in digital mode, say) gives the model
+    # nothing to measure pixels against. Asked for pixels anyway it spends its
+    # reasoning guessing the image resolution, and still answers in its own
+    # 0-1000 frame, so the boxes land in the page's top-left corner. Ask for
+    # that frame outright and scale it to pixels here.
+    normalized = image_size is not None and not page_words.get("words")
     user_text = _phase3_user_prompt(
         page_number=page_number,
         items=items,
         page_words=page_words,
         page_anchors=_collect_page_anchors(values, page_number),
+        image_size=image_size,
+        grid=normalized,
+    )
+    system_key = (
+        PromptKey.VALUES_PHASE3_SYSTEM_NO_WORDS if normalized else PromptKey.VALUES_PHASE3_SYSTEM
     )
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": prompt(PromptKey.VALUES_PHASE3_SYSTEM)},
+        {"role": "system", "content": prompt(system_key)},
         {
             "role": "user",
             "content": [
                 {"type": "text", "text": user_text},
-                _image_content_block(workspace.blobs.get_blob(image_key)),
+                _image_content_block(image_bytes),
             ],
         },
     ]
@@ -1239,7 +1346,7 @@ def _phase3_call_for_page(
         max_completion_tokens=_DEFAULT_MAX_COMPLETION_TOKENS,
         temperature=_DEFAULT_VALUES_TEMPERATURE,
         timeout=_DEFAULT_TIMEOUT_SECONDS,
-        reasoning_effort=_DEFAULT_REASONING_EFFORT,
+        reasoning_effort=_PHASE3_GRID_REASONING_EFFORT if normalized else _DEFAULT_REASONING_EFFORT,
     )
     forced_tool_choice = {
         "type": "function",
@@ -1273,7 +1380,10 @@ def _phase3_call_for_page(
             raise ValuesExtractionFailed(
                 f"phase 3 page {page_number}: malformed JSON args: {exc}"
             ) from exc
-        return _parse_submit_locations(args, page_number)
+        locations, dropped = _parse_submit_locations(
+            args, page_number, image_size=image_size, normalized=normalized
+        )
+        return _Phase3PageResult(locations=locations, grid=normalized, boxes_dropped=dropped)
 
     raise ValuesExtractionFailed(
         f"phase 3 page {page_number} exceeded max_tool_iters={max_tool_iters}"
@@ -1281,15 +1391,26 @@ def _phase3_call_for_page(
 
 
 def _parse_submit_locations(
-    args: dict[str, Any], page_number: int
-) -> dict[str, list[dict[str, Any]]]:
+    args: dict[str, Any],
+    page_number: int,
+    *,
+    image_size: tuple[int, int] | None = None,
+    normalized: bool = False,
+) -> tuple[dict[str, list[dict[str, Any]]], int]:
     """Parse a ``submit_locations`` tool-args payload into
-    ``{id → locations}``. Malformed entries are dropped silently —
-    they'll show up as unresolved in the stats."""
+    ``({id → locations}, boxes_dropped)``. Malformed entries are dropped
+    silently — they'll show up as unresolved in the stats.
+
+    With ``normalized`` the model answered on a 0-1000 grid and each box is
+    scaled to ``image_size`` pixels. A box that is empty or inverted, or (with
+    ``image_size`` known) leaves the page, is dropped rather than stored and
+    counted in ``boxes_dropped``: the value then stays unresolved instead of
+    pointing at the wrong spot."""
     raw = args.get("locations")
     out: dict[str, list[dict[str, Any]]] = {}
+    dropped = 0
     if not isinstance(raw, list):
-        return out
+        return out, dropped
     for entry in raw:
         if not isinstance(entry, dict):
             continue
@@ -1303,11 +1424,74 @@ def _parse_submit_locations(
                 continue
             if not all(isinstance(c, (int, float)) for c in bbox):
                 continue
+            box = _to_page_pixels(bbox, image_size=image_size, normalized=normalized)
+            if box is None:
+                dropped += 1
+                continue
             # Boxes are integer image pixels [left, top, right, bottom].
-            locs.append({"page_number": page_number, "bounding_box": [round(c) for c in bbox]})
+            locs.append({"page_number": page_number, "bounding_box": box})
         if locs:
             out[item_id] = locs
-    return out
+    return out, dropped
+
+
+# Tolerance, as a share of the page side, for a box edge past the image
+# border (about 50-65 px on a 300 dpi Letter page): over-covering by a few
+# pixels is what the prompt asks for, so an edge just outside is clamped, and
+# only a box well off the page is dropped.
+_BOX_EDGE_SLACK = 0.02
+
+
+def _to_page_pixels(
+    bbox: Sequence[float],
+    *,
+    image_size: tuple[int, int] | None,
+    normalized: bool,
+) -> list[int] | None:
+    """Turn one returned box into integer page pixels, or ``None`` to drop it.
+
+    Scales a 0-1000 box when ``normalized``, then (with ``image_size`` known)
+    clamps edges within the slack of the border and rejects a box that is
+    inverted, empty, or lies off the page."""
+    left, top, right, bottom = (float(c) for c in bbox)
+    if normalized and image_size is not None:
+        width, height = image_size
+        left, right = left * width / 1000, right * width / 1000
+        top, bottom = top * height / 1000, bottom * height / 1000
+    if image_size is not None:
+        width, height = image_size
+        slack_x, slack_y = width * _BOX_EDGE_SLACK, height * _BOX_EDGE_SLACK
+        if (
+            left < -slack_x
+            or top < -slack_y
+            or right > width + slack_x
+            or bottom > height + slack_y
+        ):
+            return None
+        left, right = max(0.0, left), min(float(width), right)
+        top, bottom = max(0.0, top), min(float(height), bottom)
+    box = [round(left), round(top), round(right), round(bottom)]
+    if box[2] <= box[0] or box[3] <= box[1]:
+        return None
+    return box
+
+
+def _page_pixel_size(
+    workspace: Workspace, file_id: str, page_number: int, image_bytes: bytes
+) -> tuple[int, int] | None:
+    """``(width, height)`` of the page image the model is shown: read from the
+    PNG header, else from ``page_text`` (which records the same size), else
+    ``None``, in which case phase 3 keeps the plain pixel prompt."""
+    size: tuple[Any, Any]
+    try:
+        size = _png_dimensions(image_bytes)
+    except ValueError:
+        payload = workspace.read_page_text(file_id, page_number) or {}
+        size = (payload.get("width"), payload.get("height"))
+    width, height = size
+    if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
+        return width, height
+    return None
 
 
 def _patch_value_with_locations(
@@ -1384,6 +1568,8 @@ def _phase3_user_prompt(
     items: list[UnmatchedItem],
     page_words: dict[str, Any],
     page_anchors: list[dict[str, Any]],
+    image_size: tuple[int, int] | None = None,
+    grid: bool = False,
 ) -> str:
     items_lines = [
         f"- id: {it.id}; path: {path_to_str(it.path)}; text: {json.dumps(it.text)}" for it in items
@@ -1396,8 +1582,21 @@ def _phase3_user_prompt(
     # :mod:`dgml_core.toon`, measured at -72.2% input tokens versus the former
     # ``json.dumps(..., indent=2)`` array). Lossless; only the words given TO
     # the model change — the ``submit_locations`` response contract is untouched.
+    if grid:
+        # A page reaches the grid only without words, so phase 2 placed nothing
+        # on it and there are no anchors to show.
+        return prompt(PromptKey.VALUES_PHASE3_USER_NO_WORDS).format(
+            page_number=page_number,
+            needs_locating="\n".join(items_lines),
+        )
+    size_line = (
+        f" The page image is {image_size[0]} x {image_size[1]} pixels (width x height)."
+        if image_size is not None
+        else ""
+    )
     return prompt(PromptKey.VALUES_PHASE3_USER).format(
         page_number=page_number,
+        image_size=size_line,
         ocr_words=encode_phase3_words(page_words.get("words", [])),
         known_locations="\n".join(anchors_lines),
         needs_locating="\n".join(items_lines),
@@ -1432,7 +1631,9 @@ def _submit_locations_tool(ids: list[str]) -> dict[str, Any]:
                                     "type": "array",
                                     "minItems": 1,
                                     "items": {
-                                        # [left, top, right, bottom] in image pixels.
+                                        # [left, top, right, bottom]: image pixels,
+                                        # or the 0-1000 grid on a page without
+                                        # OCR words (see _phase3_call_for_page).
                                         "type": "array",
                                         "items": {
                                             "type": "integer",
@@ -1596,6 +1797,7 @@ def _run_extract_loop(
     max_tool_iters: int,
     totals: dict[str, Any],
     chunked: bool = False,
+    reasoning_effort: str | None = _VALUES_REASONING_EFFORT,
 ) -> tuple[dict[str, Any], int, int]:
     """Run a multi-turn extraction loop until the model finishes submitting.
 
@@ -1633,7 +1835,8 @@ def _run_extract_loop(
     # Anthropic — only forced tool_choice triggers the Anthropic drop. That
     # also makes this the only call site where the reasoning budget has any
     # effect on Claude, which is why :data:`_VALUES_REASONING_EFFORT` applies
-    # here and nowhere else.
+    # here and nowhere else. ``reasoning_effort`` is that constant unless the
+    # workspace set ``grounded.values_reasoning_effort`` (``None`` = send none).
     llm_config = LLMConfig(
         model=model,
         api_key=api_key,
@@ -1642,7 +1845,7 @@ def _run_extract_loop(
         max_completion_tokens=_DEFAULT_MAX_COMPLETION_TOKENS,
         temperature=_DEFAULT_VALUES_TEMPERATURE,
         timeout=_DEFAULT_TIMEOUT_SECONDS,
-        reasoning_effort=_VALUES_REASONING_EFFORT,
+        reasoning_effort=reasoning_effort,
     )
 
     tool_calls_run = 0
@@ -2259,6 +2462,8 @@ def _resolve_api_key(literal: str | None, env_name: str | None) -> str | None:
 
 __all__ = [
     "DEFAULT_MAX_TOOL_ITERS",
+    "VALUES_REASONING_EFFORT_CHOICES",
+    "VALUES_REASONING_EFFORT_PROVIDER_DEFAULT",
     "ExtractionResult",
     "GroundedConfig",
     "extract_values",

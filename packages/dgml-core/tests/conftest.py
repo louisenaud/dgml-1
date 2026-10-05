@@ -232,6 +232,19 @@ def _write_page_variant_pdf(
     path.write_bytes(bytes(out))
 
 
+@pytest.fixture(autouse=True)
+def _reset_warning_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reset the library's ``_WARNED_*`` once-per-process warning dedup (see
+    the Logging section of ../CLAUDE.md) so tests stay order-independent —
+    any test may trigger these paths, not only the modules that assert on them."""
+    from dgml_core import models_config, ocr, rotation
+
+    models_config._WARNED_TIER_FALLBACKS.clear()
+    models_config._WARNED_DISABLED.clear()
+    ocr._WARNED_NO_OCR_PROVIDER.clear()
+    monkeypatch.setattr(rotation, "_WARNED_PILLOW_MISSING", False)
+
+
 @pytest.fixture
 def workspace(tmp_path: Path) -> Workspace:
     ws = Workspace(root=tmp_path / "ws")

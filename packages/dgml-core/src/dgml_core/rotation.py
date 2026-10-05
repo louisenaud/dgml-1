@@ -34,10 +34,18 @@ exactly, so image and boxes never drift.
 
 from __future__ import annotations
 
+import logging
 import math
-import warnings
 from io import BytesIO
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Whether the Pillow-missing warning was already logged. Pillow's availability is
+# process-global and cannot change mid-run, so one line per process is the right
+# amount — deskew_page runs once per skewed page, and a 200-page scan needs the
+# install hint once, not 200 times.
+_WARNED_PILLOW_MISSING = False
 
 # Below this magnitude a page is treated as upright and left untouched — sub-degree
 # angles are rendering noise, not real skew (mirrors the prior-art threshold).
@@ -69,17 +77,20 @@ def deskew_page(
     that rotate entirely out of the (possibly re-sized) frame are dropped.
 
     If Pillow is unavailable, returns the inputs unchanged (image, dims, words)
-    and warns — OCR text is still usable, just not deskewed.
+    and logs a warning, once per process — OCR text is still usable, just not
+    deskewed.
     """
+    global _WARNED_PILLOW_MISSING
     try:
         from PIL import Image
     except ImportError:
-        warnings.warn(
-            "Pillow is not installed; skipping page deskew for a skewed page "
-            f"(angle={angle:.2f}°). Install with `pip install dgml[azure]` "
-            "(or dgml[aws]) to enable deskew.",
-            stacklevel=2,
-        )
+        if not _WARNED_PILLOW_MISSING:
+            _WARNED_PILLOW_MISSING = True
+            logger.warning(
+                "Pillow is not installed; skipping page deskew for this and any "
+                f"further skewed pages (this page's angle={angle:.2f}°). Install "
+                "with `pip install dgml[azure]` (or dgml[aws]) to enable deskew."
+            )
         return image_bytes, dims, words
 
     expand = abs(angle) >= ROTATE_EXPAND_ANGLE_DEG

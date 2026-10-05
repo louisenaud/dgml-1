@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -34,12 +35,15 @@ from dgml_core.errors import (
 )
 from dgml_core.extraction_schema import parse_rnc
 from dgml_core.extraction_xml import dgml_xml_to_values
+from dgml_core.files import FileStore
 from dgml_core.grounded import (
     _SCHEMA_TREE_MAX_DEPTH,
     DEFAULT_MAX_TOOL_ITERS,
     GroundedConfig,
     _field_node_schema,
+    _pdf_bytes,
     _submit_schema_tool,
+    _to_page_pixels,
     extract_values,
     generate_schema,
     get_page_words,
@@ -137,6 +141,12 @@ def _seed_page_image(workspace: Workspace, file_id: str, page: int) -> None:
     """Drop a minimal PNG so phase-3 ``image_path.exists()`` passes.
     Bytes never reach a real decoder — litellm is mocked in these tests."""
     workspace.blobs.put_blob(layout.file_page_image_key(file_id, page), b"\x89PNG\r\n\x1a\n")
+
+
+def _png_header(width: int, height: int) -> bytes:
+    """The PNG signature plus an IHDR chunk: enough for the size to be read."""
+    ihdr = width.to_bytes(4, "big") + height.to_bytes(4, "big") + b"\x08\x02\x00\x00\x00"
+    return b"\x89PNG\r\n\x1a\n" + (13).to_bytes(4, "big") + b"IHDR" + ihdr + b"\x00" * 4
 
 
 def _tool_call_response(
@@ -296,6 +306,47 @@ def test_load_config_defaults(workspace: Workspace) -> None:
     assert config.schema_api_key_env is None
     assert config.values_api_key_env is None
     assert config.max_tool_iters == DEFAULT_MAX_TOOL_ITERS
+    # Unset, the values reasoning effort is the module's measured default.
+    assert config.values_reasoning_effort == "medium"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("low", "low"),
+        ("high", "high"),
+        ("none", "none"),  # litellm's own value: sent, asks the provider for no thinking
+        ("default", None),  # send no reasoning effort at all
+    ],
+)
+def test_load_config_reads_values_reasoning_effort(
+    workspace: Workspace, raw: str, expected: str | None
+) -> None:
+    _write_grounded_config(
+        workspace,
+        {
+            "schema_model": DEFAULT_SCHEMA_MODEL,
+            "values_model": DEFAULT_VALUES_MODEL,
+            "values_reasoning_effort": raw,
+        },
+    )
+    assert load_grounded_config(workspace).values_reasoning_effort == expected
+
+
+@pytest.mark.parametrize("raw", ["turbo", "", "Low", 3, True])
+def test_load_config_rejects_unknown_values_reasoning_effort(
+    workspace: Workspace, raw: object
+) -> None:
+    _write_grounded_config(
+        workspace,
+        {
+            "schema_model": DEFAULT_SCHEMA_MODEL,
+            "values_model": DEFAULT_VALUES_MODEL,
+            "values_reasoning_effort": raw,
+        },
+    )
+    with pytest.raises(GroundedConfigInvalid, match="values_reasoning_effort"):
+        load_grounded_config(workspace)
 
 
 def test_load_config_rejects_empty_api_key_env(workspace: Workspace) -> None:
@@ -635,13 +686,14 @@ def test_extract_values_drops_temperature_for_anthropic(
 
 def test_lower_values_budget_does_not_reach_location_grounding(workspace: Workspace) -> None:
     """Value extraction runs at a lower reasoning budget than the rest of the
-    pipeline; location grounding must keep the module default.
+    pipeline; location grounding on a page with OCR words must keep the module
+    default (only the no-words grid path is lowered, by its own constant).
 
     Location grounding forces ``tool_choice``, so Anthropic drops the setting
-    either way — but other providers keep it, and lowering their budget was never
-    measured. A Gemini values model makes the value observable on both calls, so
-    this pins the boundary instead of trusting it. Needs text phase 2 cannot
-    match, which is what sends grounding to the LLM at all."""
+    either way — but other providers keep it. A Gemini values model makes the
+    value observable on both calls, so this pins the boundary instead of
+    trusting it. Needs text phase 2 cannot match, which is what sends
+    grounding to the LLM at all."""
     fid = "f1aaaaaaaaaa"
     _seed_file(workspace, fid)
     _seed_page_text(workspace, fid, page=1)  # only contains "Hello", "world"
@@ -663,6 +715,80 @@ def test_lower_values_budget_does_not_reach_location_grounding(workspace: Worksp
     assert m.call_count == 2
     assert m.call_args_list[0].kwargs["reasoning_effort"] == "medium"
     assert m.call_args_list[1].kwargs["reasoning_effort"] == "high"
+
+
+def _extract_with_grounding_call(workspace: Workspace, config: GroundedConfig) -> list[Any]:
+    """One extraction whose text phase 2 cannot match, so both LLM calls run:
+    value extraction (phase 1) and location grounding (phase 3). Returns the
+    two ``litellm.completion`` calls."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)  # only contains "Hello", "world"
+    _seed_page_image(workspace, fid, 1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 56, 200, 76]]}]}
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ) as m:
+        extract_values(workspace, ds_id, fid, config=config)
+    assert m.call_count == 2
+    return list(m.call_args_list)
+
+
+def test_configured_values_effort_reaches_value_extraction_only(workspace: Workspace) -> None:
+    """``values_reasoning_effort`` sets the budget of the value-extraction call
+    and nothing else: location grounding keeps the module default. A Gemini
+    values model makes both calls observable (Anthropic drops the setting on
+    the forced grounding call either way)."""
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL,
+        values_model=DEFAULT_VALUES_MODEL,
+        values_reasoning_effort="low",
+    )
+    phase1, phase3 = _extract_with_grounding_call(workspace, config)
+    assert phase1.kwargs["reasoning_effort"] == "low"
+    assert phase3.kwargs["reasoning_effort"] == "high"
+
+
+def test_values_effort_default_sends_no_reasoning_effort(workspace: Workspace) -> None:
+    """``None`` (the config's ``"default"``) leaves the value-extraction budget
+    to the provider: the field is absent from that request, and still present
+    on location grounding, which this setting does not govern."""
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL,
+        values_model=DEFAULT_VALUES_MODEL,
+        values_reasoning_effort=None,
+    )
+    phase1, phase3 = _extract_with_grounding_call(workspace, config)
+    assert "reasoning_effort" not in phase1.kwargs
+    assert phase3.kwargs["reasoning_effort"] == "high"
+
+
+def test_configured_values_effort_reaches_anthropic_value_extraction(
+    workspace: Workspace,
+) -> None:
+    """Value extraction runs with ``tool_choice`` auto, so an Anthropic values
+    model receives the configured effort too (the wrapper only drops it on a
+    forced tool call)."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    phase1_values = {"title": {"text": "Hello world", "locations": [{"page_number": 1}]}}
+    response = _tool_call_response("submit_values", {"values": phase1_values})
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL,
+        values_model="anthropic/claude-sonnet-5",
+        values_reasoning_effort="low",
+    )
+    with patch("litellm.completion", return_value=response) as m:
+        extract_values(workspace, ds_id, fid, config=config)
+    assert m.call_args_list[0].kwargs["reasoning_effort"] == "low"
 
 
 def test_generate_schema_rejects_empty_file_list(workspace: Workspace) -> None:
@@ -921,6 +1047,192 @@ def test_extract_values_phase3_words_are_toon_encoded(
     ]
 
 
+def test_extract_values_phase3_page_without_words_uses_the_grid(workspace: Workspace) -> None:
+    """A page with no OCR words (a scan added in digital mode) gives the model
+    nothing to measure pixels against. Phase 3 then asks for boxes on a 0-1000
+    grid, says the page has no words, and scales the answer to page pixels."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, width=2550, height=3300, words=[])
+    workspace.blobs.put_blob(layout.file_page_image_key(fid, 1), _png_header(2550, 3300))
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 50, 200, 60]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    kwargs = mock_completion.call_args_list[1].kwargs
+    messages = kwargs["messages"]
+    assert "0-1000 grid" in messages[0]["content"]
+    assert "IMAGE PIXELS" not in messages[0]["content"]
+    user_text = messages[1]["content"][0]["text"]
+    assert "no OCR words" in user_text and "words[" not in user_text
+    assert kwargs["reasoning_effort"] == "medium"
+    assert result.values["title"]["locations"] == [
+        {"page_number": 1, "bounding_box": [255, 165, 510, 198]}
+    ]
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    phase3 = stats["phases"]["phase3"]
+    assert (phase3["grid_pages"], phase3["boxes_dropped"]) == (1, 0)
+
+
+def test_extract_values_phase3_states_the_image_size(workspace: Workspace) -> None:
+    """With words on the page the pixel contract stays, and the prompt says how
+    big the image is, so pixel coordinates have a known frame."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, width=2550, height=3300)
+    workspace.blobs.put_blob(layout.file_page_image_key(fid, 1), _png_header(2550, 3300))
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 56, 200, 76]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    kwargs = mock_completion.call_args_list[1].kwargs
+    assert "IMAGE PIXELS" in kwargs["messages"][0]["content"]
+    assert "2550 x 3300 pixels (width x height)" in kwargs["messages"][1]["content"][0]["text"]
+    # pages with words keep the default budget; only the grid path is lowered
+    assert kwargs["reasoning_effort"] == "high"
+    assert result.values["title"]["locations"] == [
+        {"page_number": 1, "bounding_box": [100, 56, 200, 76]}
+    ]
+
+
+def test_extract_values_phase3_drops_a_box_off_the_page(workspace: Workspace) -> None:
+    """A box that lies outside the page image is dropped, not stored: the value
+    stays without a box instead of pointing at the wrong spot."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    workspace.blobs.put_blob(layout.file_page_image_key(fid, 1), _png_header(1000, 1000))
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[900, 56, 1400, 76]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ):
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    assert result.values["title"]["locations"] == [{"page_number": 1}]
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    phase3 = stats["phases"]["phase3"]
+    assert (phase3["grid_pages"], phase3["boxes_dropped"]) == (0, 1)
+
+
+@pytest.mark.parametrize(
+    ("bbox", "normalized", "expected"),
+    [
+        ([100, 50, 200, 60], True, [255, 165, 510, 198]),
+        ([100, 56, 200, 76], False, [100, 56, 200, 76]),
+        # an edge a few pixels past the border is clamped, on either axis
+        ([2500, 10, 2590, 40], False, [2500, 10, 2550, 40]),
+        ([100, 3250, 200, 3350], False, [100, 3250, 200, 3300]),
+        ([100, -20, 200, 40], False, [100, 0, 200, 40]),
+        # well off the page, on any side, inverted, or empty: dropped
+        ([2700, 10, 2800, 40], False, None),
+        ([100, 3400, 200, 3500], False, None),
+        ([100, 3000, 200, 3500], False, None),
+        ([2400, 10, 2800, 40], False, None),
+        ([100, -200, 200, 40], False, None),
+        ([200, 10, 100, 40], False, None),
+        ([100, 10, 100, 40], False, None),
+        ([100.2, 10, 100.4, 40], False, None),
+        # a grid box past 1000 is off the page too
+        ([100, 50, 1100, 60], True, None),
+    ],
+)
+def test_to_page_pixels(bbox: list[float], normalized: bool, expected: list[int] | None) -> None:
+    assert _to_page_pixels(bbox, image_size=(2550, 3300), normalized=normalized) == expected
+
+
+def test_to_page_pixels_without_a_known_size_keeps_the_box() -> None:
+    assert _to_page_pixels([100, 5, 99999, 60], image_size=None, normalized=False) == [
+        100,
+        5,
+        99999,
+        60,
+    ]
+
+
+def test_extract_values_phase3_size_from_page_text_when_the_image_header_is_unreadable(
+    workspace: Workspace,
+) -> None:
+    """The size comes from the PNG header, else from ``page_text``. A page with
+    no words and an unreadable header still takes the grid path."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, width=2550, height=3300, words=[])
+    _seed_page_image(workspace, fid, 1)  # signature only, no IHDR
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 50, 200, 60]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    assert "0-1000 grid" in mock_completion.call_args_list[1].kwargs["messages"][0]["content"]
+    assert result.values["title"]["locations"] == [
+        {"page_number": 1, "bounding_box": [255, 165, 510, 198]}
+    ]
+
+
+def test_extract_values_phase3_zero_size_keeps_the_pixel_prompt(workspace: Workspace) -> None:
+    """A header reporting a zero size is no size: no grid, no size line."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, width=0, height=0, words=[])
+    workspace.blobs.put_blob(layout.file_page_image_key(fid, 1), _png_header(0, 0))
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 56, 200, 76]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ) as mock_completion:
+        extract_values(workspace, ds_id, fid, config=config)
+
+    messages = mock_completion.call_args_list[1].kwargs["messages"]
+    assert "IMAGE PIXELS" in messages[0]["content"]
+    assert "pixels (width x height)" not in messages[1]["content"][0]["text"]
+
+
 def test_extract_values_phase3_merges_costs_across_parallel_pages(
     workspace: Workspace,
 ) -> None:
@@ -1057,6 +1369,8 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
     assert set(stats["phases"]["phase3"].keys()) == {
         "duration_s",
         "page_calls",
+        "grid_pages",
+        "boxes_dropped",
         "pages_out_of_range",
         "cost_usd",
         "prompt_tokens",
@@ -2327,6 +2641,29 @@ def test_phase3_never_cached(workspace: Workspace) -> None:
         assert _cache_control_paths(call.kwargs["messages"]) == []
 
 
+def test_extract_values_refuses_a_stored_schema_whose_invariant_cannot_resolve(
+    workspace: Workspace,
+) -> None:
+    """A schema stored before the load-time check (written here around
+    ``set_schema``, which now refuses it) still reads back, but an extraction
+    with it fails before any model call instead of never checking the rule."""
+    from dgml_core.errors import SchemaInvalid
+
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    bad = _TITLE_RNC.replace("title =\n", "## Invariant: count(Missing)\ntitle =\n", 1)
+    assert bad != _TITLE_RNC
+    workspace.blobs.put_blob(layout.docset_extraction_schema_key(ds_id), bad.encode("utf-8"))
+    assert DocSetStore(workspace).get_schema(ds_id) == bad
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch("litellm.completion") as completion:
+        with pytest.raises(SchemaInvalid, match="names no collection"):
+            extract_values(workspace, ds_id, fid, config=config)
+    assert completion.call_count == 0
+
+
 # ---------------------------------------------------------------------------
 # phase 3 and a page the file does not have (dgml-io/dgml#155)
 # ---------------------------------------------------------------------------
@@ -2688,3 +3025,46 @@ def test_extract_values_repeats_the_latest_conversion_error(workspace: Workspace
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
     with pytest.raises(ConversionFailed, match=r"converting it failed: second attempt$"):
         extract_values(workspace, ds_id, fid, config=config)
+
+
+def test_pdf_bytes_reads_a_source_stored_with_an_uppercase_suffix(
+    workspace: Workspace, sample_pdf: Path
+) -> None:
+    """`file add` lowercases the suffix to validate a source, so `INVOICE.PDF`
+    is accepted as a PDF and stored under that name; the extraction lookup
+    used to match the stored key against `.pdf` case-sensitively and refuse
+    the file as having no source PDF."""
+    upper = sample_pdf.with_name("INVOICE.PDF")
+    upper.write_bytes(sample_pdf.read_bytes())
+    record = FileStore(workspace).add(upper).record
+    assert record.original_filename == "INVOICE.PDF"
+
+    assert _pdf_bytes(workspace, record.id) == upper.read_bytes()
+
+    # The negative side is unchanged: a record whose only blob is not a PDF
+    # under any casing still has no source PDF.
+    _seed_file(workspace, "f2bbbbbbbbbb", filename="doc.docx")
+    with pytest.raises(FileNotFound, match=r"file 'f2bbbbbbbbbb' has no source PDF$"):
+        _pdf_bytes(workspace, "f2bbbbbbbbbb")
+
+
+def test_pdf_bytes_reads_the_pdf_converted_from_a_source(workspace: Workspace) -> None:
+    """A convertible source's PDF is the `<stem>.pdf` sibling `file add` persists."""
+    fid = "f3cccccccccc"
+    _seed_file(workspace, fid, filename="report.docx", pdf_bytes=b"the docx")
+    workspace.blobs.put_blob(layout.file_pdf_key(fid, "report.docx"), b"%PDF converted")
+
+    assert _pdf_bytes(workspace, fid) == b"%PDF converted"
+
+
+def test_pdf_bytes_does_not_read_another_pdf_under_the_file_prefix(workspace: Workspace) -> None:
+    """The PDF is read only at its derived key. A filename is not unique in the
+    workspace, so a PDF found elsewhere under the file's prefix is not taken
+    for it: the file has no source PDF."""
+    fid = "f4dddddddddd"
+    _seed_file(workspace, fid, filename="doc.pdf")
+    workspace.blobs.delete_blobs(layout.file_source_key(fid, "doc.pdf"))
+    workspace.blobs.put_blob(layout.file_source_key(fid, "other.pdf"), b"%PDF other")
+
+    with pytest.raises(FileNotFound, match=r"file 'f4dddddddddd' has no source PDF$"):
+        _pdf_bytes(workspace, fid)

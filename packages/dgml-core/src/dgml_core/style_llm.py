@@ -31,7 +31,7 @@ stays free of any LLM dependency.
 from __future__ import annotations
 
 import json
-import sys
+import logging
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -43,6 +43,8 @@ from .storage import Workspace
 from .storage_service import BlobStore
 from .style import ALLOWED, merge_styles, validate_style
 from .usage import OPERATION_STYLE_ANNOTATE
+
+logger = logging.getLogger(__name__)
 
 # How many grounded snippets to show per page request — a soft bound so a dense
 # page doesn't blow up the prompt; excess snippets are simply left unstyled.
@@ -134,9 +136,11 @@ def annotate_style_from_image(
     rather than prefetched, capping resident image bytes at ``max_concurrency``
     pages instead of the whole document.
 
-    Failed pages are reported to stderr under ``debug``; a model-unreachability
-    failure (bad key, bad model id, dead endpoint) is reported once rather than
-    once per page, since it recurs identically on all of them.
+    Failed pages are logged at INFO, one line each. A model-unreachability
+    failure (bad key, bad model id, dead endpoint) is additionally logged once
+    at WARNING rather than once per page, since it recurs identically on all of
+    them — and it leaves the whole document unstyled, which the user must hear
+    about without asking.
 
     Each page is one vision call, which records its own ``usage.jsonl`` row
     (labelled ``style_annotate``, gated on ``debug``) from the recording context
@@ -209,7 +213,7 @@ def annotate_style_from_image(
                 el.set(style_attr, merged)
                 styled += 1
 
-    if debug and failures:
+    if failures:
         _report_failures(failures, unreachable, total_pages=len(jobs))
     return styled
 
@@ -220,15 +224,16 @@ def _report_failures(
     *,
     total_pages: int,
 ) -> None:
-    """Name every failed page on stderr, in page order, plus one summary line
+    """Log every failed page (INFO), in page order, plus one WARNING summary
     when the model itself could not be reached."""
     for page, exc in failures:
-        print(f"style: page {page}: {short_error_message(exc)}", file=sys.stderr)
+        logger.info("style: page %d: %s", page, short_error_message(exc))
     if unreachable is not None:
-        print(
-            f"style: model unreachable ({short_error_message(unreachable)}); "
-            f"{len(failures)}/{total_pages} pages failed",
-            file=sys.stderr,
+        logger.warning(
+            "style: model unreachable (%s); %d/%d pages failed",
+            short_error_message(unreachable),
+            len(failures),
+            total_pages,
         )
 
 

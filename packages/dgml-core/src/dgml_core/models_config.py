@@ -24,6 +24,13 @@ task's own section (e.g. ``generation.api_key_env``, ``grounded.schema_api_key``
 a model sourced from a tier uses its task section's credentials, or falls back to
 litellm's per-provider env-var conventions when the section sets none.
 
+``family`` picks a whole provider family's defaults: one of the
+:data:`~dgml_core.default_config.PROVIDER_MODELS` keys. It is shorthand for that
+family's four tiers *within its config layer* (see :func:`expand_family`): tiers
+the same layer sets win, and the expanded tiers override any a lower layer set.
+A family-based config tracks dgml's shipped defaults across upgrades; explicit
+tiers are the pinning mechanism.
+
 A tier that is unset falls back to the nearest set tier (nearest *lower* first,
 then higher), emitting a warning — so a minimal config that sets only, say,
 ``standard`` still resolves every task.
@@ -31,12 +38,15 @@ then higher), emitting a warning — so a minimal config that sets only, say,
 
 from __future__ import annotations
 
-import sys
+import logging
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from .default_config import PROVIDER_MODELS
 from .errors import DgmlError, ModelsConfigInvalid
+
+logger = logging.getLogger(__name__)
 
 
 class Tier(StrEnum):
@@ -79,7 +89,7 @@ class ConfigSection(StrEnum):
 TIERS: tuple[Tier, ...] = tuple(Tier)
 
 # Tier fallbacks already reported this process, so a per-file loop (e.g. bulk
-# extract) doesn't flood stderr with the same line. Keyed by (requested, used).
+# extract) doesn't repeat the same warning. Keyed by (requested, used).
 _WARNED_TIER_FALLBACKS: set[tuple[Tier, Tier]] = set()
 
 # Same idea for "configured but not enabled" advisories (see `section_enabled`):
@@ -101,8 +111,8 @@ class ModelsConfig:
         """Resolve ``tier`` to its model string.
 
         If ``tier`` has no model, fall back to the nearest set tier — lower
-        (cheaper) neighbours first, then higher — and write a warning to stderr
-        (always, independent of ``--verbose``). Returns ``None`` when no tier is
+        (cheaper) neighbours first, then higher — and log a WARNING (once per
+        process per fallback). Returns ``None`` when no tier is
         set at all (the caller then surfaces the appropriate config error)."""
         if tier not in TIERS:
             raise ValueError(f"unknown model tier {tier!r}")
@@ -111,9 +121,9 @@ class ModelsConfig:
             return None
         if actual != tier and (tier, actual) not in _WARNED_TIER_FALLBACKS:
             _WARNED_TIER_FALLBACKS.add((tier, actual))
-            sys.stderr.write(
+            logger.warning(
                 f"[dgml] model tier '{tier}' is not set; falling back to '{actual}' "
-                f"('{getattr(self, actual)}'). Set [models].{tier} to silence this.\n"
+                f"('{getattr(self, actual)}'). Set [models].{tier} to silence this."
             )
         model: str | None = getattr(self, actual)
         return model
@@ -138,14 +148,32 @@ def _validate_optional_str(value: Any, field: str) -> str | None:
     return value
 
 
+def expand_family(models: dict[str, Any]) -> dict[str, Any]:
+    """Return one config layer's ``[models]`` table with its ``family`` expanded
+    into the tiers the table leaves unset. Called per layer *before* the merge, so
+    a family overrides lower-layer tiers. A malformed or unknown family is left
+    as-is for :func:`load_models_config` to reject."""
+    family = models.get("family")
+    defaults = PROVIDER_MODELS.get(family) if isinstance(family, str) else None
+    return models if defaults is None else {**defaults, **models}
+
+
 def load_models_config(merged: dict[ConfigSection, Any]) -> ModelsConfig:
     """Build a :class:`ModelsConfig` from the merged config mapping's
-    ``[models]`` section (an empty section yields an all-``None`` config)."""
+    ``[models]`` section (an empty section yields an all-``None`` config).
+
+    ``family`` is validated here but not expanded — :func:`expand_family` has
+    already done that per layer during the merge."""
     section = merged.get(ConfigSection.MODELS)
     if section is None:
         return ModelsConfig()
     if not isinstance(section, dict):
         raise ModelsConfigInvalid("'models' must be a table")
+    family = _validate_optional_str(section.get("family"), "family")
+    if family is not None and family not in PROVIDER_MODELS:
+        raise ModelsConfigInvalid(
+            f"'models.family' must be one of {', '.join(sorted(PROVIDER_MODELS))}; got {family!r}"
+        )
     return ModelsConfig(
         **{t.value: _validate_optional_str(section.get(t.value), t.value) for t in TIERS}
     )
@@ -179,9 +207,9 @@ def section_enabled(
         raise invalid(f"'{section_name}.enabled' must be true or false")
     if not enabled and set(section) - {"enabled"} and section_name not in _WARNED_DISABLED:
         _WARNED_DISABLED.add(section_name)
-        sys.stderr.write(
+        logger.warning(
             f"[dgml] the [{section_name}] config section is configured but not enabled; "
-            f"it will be ignored. Set {section_name}.enabled = true to use it.\n"
+            f"it will be ignored. Set {section_name}.enabled = true to use it."
         )
     return enabled
 
@@ -247,8 +275,8 @@ def resolve_tiered_model(
         model = load_models_config(merged).resolve(tier)
     if not isinstance(model, str) or not model.strip():
         raise missing(
-            f"no {model_field} for {section_name}: set [models].{tier} or "
-            f"'{section_name}.{model_field}' in the config"
+            f"no {model_field} for {section_name}: set [models].family, [models].{tier}, "
+            f"or '{section_name}.{model_field}' in the config"
         )
 
     return ResolvedModel(model=model, api_key=api_key, api_key_env=api_key_env, api_base=api_base)

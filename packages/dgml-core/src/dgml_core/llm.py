@@ -47,11 +47,14 @@ non-generation call sites share one implementation.
 from __future__ import annotations
 
 import base64
+import io
+import logging
 import re
 import sys
+import threading
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -69,6 +72,8 @@ from .usage import (
     extract_cost_and_tokens,
     record_usage,
 )
+
+logger = logging.getLogger(__name__)
 
 # The CLI contract is "stdout = a single JSON object" (see :mod:`dgml.cli`).
 # LiteLLM, by default, prints a "Give Feedback / Get Help" banner to *stdout*
@@ -118,6 +123,21 @@ GEMINI_MODEL_PATTERNS = [r"gemini", r"vertex_ai", r"google"]
 # claude-haiku-4-5 prefills fine across thousands of calls, so this stays a
 # narrow list rather than a blanket rule.
 ANTHROPIC_NO_PREFILL_PATTERNS = [r"claude-sonnet-5"]
+
+# Accepted values for `LLMConfig.thinking`, Anthropic's extended-thinking switch.
+#
+#   "disabled" — no thinking tokens.
+#   "adaptive" — the model decides per request (Claude 4.6+/5 only).
+#
+# OMITTING the field is not the same as "disabled": Claude 4.6+/5 models think
+# adaptively when a request carries no `thinking`, so a caller that never sets it
+# gets reasoning tokens (and their cost) silently. That is why the generation
+# pipeline states the mode explicitly instead of relying on the default.
+#
+# `{"type": "enabled", "budget_tokens": N}` is deliberately not offered here:
+# claude-sonnet-5 rejects `budget_tokens`. A caller that needs it can pass the
+# whole dict through `LLMConfig.extra`.
+ANTHROPIC_THINKING_MODES = ("disabled", "adaptive")
 
 # OpenAI families that accept ONLY the default temperature (1). Prefix-matched
 # so future point releases are covered automatically; see
@@ -311,6 +331,12 @@ class LLMConfig:
     max_completion_tokens: int | None = None
     timeout: float | None = None
     reasoning_effort: str | None = None
+    # Anthropic extended thinking; one of :data:`ANTHROPIC_THINKING_MODES`.
+    # ``None`` means "don't send the field" and therefore leaves the model's own
+    # default in force — which for Claude 4.6+/5 is adaptive thinking, not off.
+    # Ignored for non-Anthropic models, and skipped when ``reasoning_effort``
+    # already expresses the same intent (see :func:`_build_completion_kwargs`).
+    thinking: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     # ---- Usage telemetry -------------------------------------------------
@@ -328,6 +354,16 @@ class LLMConfig:
     # the call functions fold their usage into it (one aggregated row for the
     # whole scope) instead of each writing its own row. Never set by callers.
     _usage_sink: dict[str, Any] | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # Fail here rather than let the provider 400 on an unknown mode: the
+        # value usually arrives from config, and the config file is where the
+        # typo is.
+        if self.thinking is not None and self.thinking not in ANTHROPIC_THINKING_MODES:
+            raise ValueError(
+                f"thinking must be one of {list(ANTHROPIC_THINKING_MODES)} or None "
+                f"(got {self.thinking!r})"
+            )
 
 
 @dataclass
@@ -652,6 +688,10 @@ def _build_completion_kwargs(
     ``reasoning_effort`` if the config set one. ``temperature`` is never
     sent to Anthropic-routed models — newer Claude models reject it as
     deprecated, and older ones only accept 1 with thinking enabled.
+
+    ``thinking`` follows the same shape: sent only to Anthropic-routed
+    models, and only when ``reasoning_effort`` did not already claim the
+    field.
     """
     _require_supported_model(config.model, config.api_base)
     kwargs: dict[str, Any] = {
@@ -712,22 +752,127 @@ def _build_completion_kwargs(
         if not (forced and is_anthropic_model(config.model)):
             kwargs["reasoning_effort"] = config.reasoning_effort
 
+    # Extended thinking, Anthropic only — the field is Anthropic-shaped, and
+    # every other provider spells reasoning differently. Skipped when
+    # `reasoning_effort` survived the rule above, because litellm translates
+    # that into the same `thinking` field for Anthropic and sending both makes
+    # the request self-contradictory; the caller's explicit effort wins.
+    if (
+        config.thinking is not None
+        and is_anthropic_model(config.model)
+        and "reasoning_effort" not in kwargs
+    ):
+        kwargs["thinking"] = {"type": config.thinking}
+
     kwargs.update(config.extra)
     return kwargs
 
 
+# Prefix on every captured-stdout record. Doubles as the echo breaker: a line
+# already carrying it came from this sink (a pathological handler writing to
+# the live ``sys.stdout``), so it is dropped instead of re-logged — on any
+# thread, however many handler/queue hops it took to come back.
+_CAPTURE_MARKER = "stdout captured during an LLM call:"
+
+
+class _StdoutToLog(io.TextIOBase):
+    """File-like sink turning a dependency's stray stdout into WARNING records.
+
+    ``write`` buffers until a newline so one log record is one printed line,
+    however the writes were chunked; the last guard out empties the buffer via
+    :meth:`drain`. ``flush`` is deliberately the inherited no-op — flushing
+    means "push to the OS" and there is no OS buffer here, so a dependency's
+    mid-line ``flush()`` must not split its line into two records.
+
+    One instance is shared by every concurrently active guard, so buffer
+    updates take a lock. It is a *leaf* lock — records are emitted only after
+    it is released — and lines carrying :data:`_CAPTURE_MARKER` are dropped,
+    so a handler that itself writes to the live ``sys.stdout`` can neither
+    deadlock against the sink nor echo through it unboundedly."""
+
+    # TextIOBase declares no codec; a dependency probing ``sys.stdout.encoding``
+    # before printing non-ASCII expects a real name (the old target, a stream,
+    # had one). ``fileno()`` stays unsupported on purpose: handing out a real fd
+    # would let writes bypass the sink.
+    encoding = "utf-8"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._buf = ""
+        self._lock = threading.Lock()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, s: str) -> int:
+        lines: list[str] = []
+        with self._lock:
+            self._buf += s
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                if line.strip() and _CAPTURE_MARKER not in line:
+                    lines.append(line)
+        for line in lines:
+            logger.warning("%s %s", _CAPTURE_MARKER, line)
+        return len(s)
+
+    def drain(self) -> None:
+        """Emit any trailing partial line; the last guard out calls this."""
+        with self._lock:
+            tail, self._buf = self._buf, ""
+        if tail.strip() and _CAPTURE_MARKER not in tail:
+            logger.warning("%s %s", _CAPTURE_MARKER, tail)
+
+
+# State for _quiet_stdout: overlapping guards (LLM calls run in thread pools,
+# and sys.stdout is process-global) share ONE sink, refcounted — the first
+# guard in saves the real stdout, the last one out restores it. A per-call
+# ``redirect_stdout`` breaks under non-LIFO exits: A enters (saves real), B
+# enters (saves A's sink), A exits (restores real), B exits (re-installs A's
+# dead sink) — leaving every later print swallowed for the rest of the process.
+_stdout_guard_lock = threading.Lock()
+_stdout_guard_depth = 0
+_stdout_guard_saved: Any = None
+_stdout_guard_sink: _StdoutToLog | None = None
+
+
 @contextmanager
 def _quiet_stdout() -> Iterator[None]:
-    """Redirect anything written to stdout onto stderr for the duration.
+    """Capture anything written to stdout and re-log it at WARNING.
 
     Guards the JSON-on-stdout CLI contract against dependencies (LiteLLM in
-    particular) that ``print`` directly to stdout. ``suppress_debug_info``
-    silences the known LiteLLM banner; this catches the rest. dgml's own
-    output is unaffected — ``_emit`` writes the JSON payload after the
-    completion call returns, outside this block.
+    particular) that ``print`` directly to stdout — raw prints bypass
+    ``logging`` entirely, so a stream-level swap is the only interception.
+    ``suppress_debug_info`` silences the known LiteLLM banner at the source;
+    by the time text lands here it is unclassified dependency output, hence
+    WARNING: visible by default in the CLI, and routed — or silenced — by a
+    library caller like any other ``dgml_core`` record. dgml's own output is
+    unaffected — ``_emit`` writes the JSON payload after the completion call
+    returns, outside this block.
+
+    Safe for overlapping calls across threads (see the guard-state comment
+    above); the swap itself remains process-global, as ``sys.stdout`` is.
     """
-    with redirect_stdout(sys.stderr):
+    global _stdout_guard_depth, _stdout_guard_saved, _stdout_guard_sink
+    with _stdout_guard_lock:
+        if _stdout_guard_depth == 0:
+            _stdout_guard_saved = sys.stdout
+            _stdout_guard_sink = _StdoutToLog()
+            sys.stdout = _stdout_guard_sink
+        _stdout_guard_depth += 1
+    try:
         yield
+    finally:
+        last_sink: _StdoutToLog | None = None
+        with _stdout_guard_lock:
+            _stdout_guard_depth -= 1
+            if _stdout_guard_depth == 0:
+                last_sink = _stdout_guard_sink
+                sys.stdout = _stdout_guard_saved
+                _stdout_guard_saved = None
+                _stdout_guard_sink = None
+        if last_sink is not None:
+            last_sink.drain()
 
 
 def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any:
@@ -853,6 +998,32 @@ def _record_call(config: LLMConfig) -> Iterator[dict[str, Any]]:
             )
 
 
+def _no_text_detail(response: Any) -> str:
+    """Why a reply carries no assistant text, as a short parenthetical.
+
+    Two causes need different fixes and the bare message told them apart in
+    neither: ``finish_reason="length"`` means the output budget ran out before
+    any text was emitted (raise ``max_tokens``, or ask for less), while a reply
+    whose only content is reasoning means the model spent the budget thinking
+    (disable thinking, or raise the budget). Extended thinking makes the second
+    case reachable on any Claude 4.6+/5 model that is left on its default.
+    """
+    reason: Any = None
+    reasoning_only = False
+    try:
+        choice = response.choices[0]
+        reason = getattr(choice, "finish_reason", None)
+        reasoning_only = bool(getattr(choice.message, "reasoning_content", None))
+    except (AttributeError, IndexError, KeyError, TypeError):
+        pass
+    parts = [
+        f"finish_reason={reason!r}" if reason else "",
+        "reasoning only" if reasoning_only else "",
+    ]
+    detail = ", ".join(x for x in parts if x)
+    return f", {detail}" if detail else ""
+
+
 def call(
     config: LLMConfig,
     *,
@@ -881,7 +1052,15 @@ def call(
     with _record_call(config) as totals:
         response = _completion_with_retry(kwargs)
         add_partial(totals, extract_cost_and_tokens(response))
-        return cast(str, response["choices"][0]["message"]["content"])
+        content = response["choices"][0]["message"]["content"]
+        if content is None:
+            # Casting None to str used to push the failure downstream, where it
+            # surfaced as an unparseable payload with no hint of the cause.
+            raise EmptyModelResponse(
+                f"model returned no message content (model={config.model!r}"
+                f"{_no_text_detail(response)})"
+            )
+        return cast(str, content)
 
 
 def call_continued(
@@ -912,8 +1091,17 @@ def call_continued(
     # ("This model does not support assistant message prefill"). That is the
     # other half of the truncation-path breakage — it cost ~13% of calls on one
     # model — so gate on the request shape, not just the provider.
-    prefill = supports_assistant_prefill(config.model) and config.reasoning_effort is None
+    prefill = (
+        supports_assistant_prefill(config.model)
+        and config.reasoning_effort is None
+        # `thinking="disabled"` is what makes prefill usable again on these
+        # models, so only an ENABLED mode has to suppress it.
+        and config.thinking != "adaptive"
+    )
     acc = ""
+    # Held for the failure path below, so a caller that set max_rounds=0 gets
+    # the same error as one whose rounds all came back textless.
+    response: Any = None
     # One aggregated row for the whole continuation (all rounds summed).
     with _record_call(config) as totals:
         for _ in range(max_rounds):
@@ -939,6 +1127,14 @@ def call_continued(
             acc += cast(str, choice.message.content or "")
             if getattr(choice, "finish_reason", None) != "length":
                 break
+    if not acc:
+        # Every round returned reasoning, or nothing at all. Returning "" here
+        # sent an empty transcription window downstream, where it read as a
+        # document the model could not transcribe rather than a call that never
+        # produced text.
+        raise EmptyModelResponse(
+            f"model returned no message content (model={config.model!r}{_no_text_detail(response)})"
+        )
     return acc
 
 

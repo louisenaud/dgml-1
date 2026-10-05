@@ -41,7 +41,7 @@ def test_returns_none_when_section_absent(workspace: Workspace) -> None:
     assert load_text_extraction_config(workspace) is None
 
 
-def test_requires_enabled(workspace: Workspace, capsys: pytest.CaptureFixture[str]) -> None:
+def test_requires_enabled(workspace: Workspace, caplog: pytest.LogCaptureFixture) -> None:
     """`enabled = true` is the switch; hybrid falls back to its heuristic merge.
 
     Mirrors `test_style.py::test_load_style_config_requires_enabled`, including
@@ -56,10 +56,10 @@ def test_requires_enabled(workspace: Workspace, capsys: pytest.CaptureFixture[st
         {"model": "m"},  # pre-`enabled` config
     ):
         models_config._WARNED_DISABLED.clear()
-        capsys.readouterr()
+        caplog.clear()
         _write_config(workspace, {"text_extraction": body})
         assert load_text_extraction_config(workspace) is None
-        warned = "not enabled" in capsys.readouterr().err
+        warned = "not enabled" in caplog.text
         assert warned is (set(body) - {"enabled"} != set())
 
 

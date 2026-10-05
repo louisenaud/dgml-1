@@ -328,6 +328,26 @@ def test_usage_is_append_only(tmp_path: Path) -> None:
     assert [e["op"] for e in store.find_docs("usage", {})] == ["label"]
 
 
+def test_usage_append_switches_off_newline_translation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The append path opens with newline="" like the atomic writers (pinned
+    on the argument: Linux CI cannot see the translation it switches off)."""
+    seen: list[object] = []
+    real_open = Path.open
+
+    def _spy(self: Path, mode: str = "r", *args: object, **kwargs: object) -> object:
+        if "a" in mode:
+            seen.append(kwargs.get("newline", "absent"))
+        return real_open(self, mode, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(Path, "open", _spy)
+    store = local_store(tmp_path)
+    store.append_doc("usage", {"op": "transcribe", "cost_usd": 0.01})
+    assert seen == [""]
+    assert (tmp_path / "usage.jsonl").read_bytes().endswith(b"}\n")
+
+
 def test_usage_tolerates_corrupt_tail(tmp_path: Path) -> None:
     store = local_store(tmp_path)
     store.append_doc("usage", {"op": "ok"})
@@ -567,6 +587,26 @@ def test_store_configs_default_to_local_with_no_config(tmp_path: Path) -> None:
     blob_cfg, doc_cfg = resolve_store_configs(ws)
     assert blob_cfg.provider == doc_cfg.provider == DEFAULT_STORAGE_PROVIDER
     assert blob_cfg.root == doc_cfg.root == ws.root
+
+
+def test_store_configs_carry_the_workspace_id_from_config_toml(tmp_path: Path) -> None:
+    """A store sharing its backend between workspaces names its data by workspace id,
+    so both roles must receive it — read from ``config.toml``'s ``[workspace]`` block,
+    since ``workspace.json`` lives inside the document store being built."""
+    from dgml_core import workspace_config as wsconfig
+    from dgml_core.storage_resolve import load_store_configs, resolve_store_configs
+
+    ws = Workspace.resolve(tmp_path)
+    wsconfig.write_identity(ws, workspace_id="ws-abc")
+    blob_cfg, doc_cfg = resolve_store_configs(ws)
+    assert blob_cfg.workspace_id == doc_cfg.workspace_id == "ws-abc"
+    # The exported entry point too — a library caller building a store from it must
+    # get a config a shared backend can open.
+    assert all(cfg.workspace_id == "ws-abc" for cfg in load_store_configs(ws))
+    # And it stays out of the seal: the id is constant per workspace, not a store identity.
+    assert storage_fingerprint(blob_cfg) == storage_fingerprint(
+        StorageConfig(provider=blob_cfg.provider, root=blob_cfg.root)
+    )
 
 
 def _same_instance(blobs: object, docs: object) -> bool:

@@ -50,6 +50,7 @@ Type detection
 from __future__ import annotations
 
 import json
+import logging
 import re
 import xml.etree.ElementTree as ET
 from collections import Counter
@@ -57,6 +58,8 @@ from pathlib import Path
 from typing import Any
 
 import dateparser  # type: ignore[import-untyped]
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Tolerant XML parsing (recover malformed input: bare & and stray close tags)
@@ -475,7 +478,7 @@ def transform_file(
             xml_bytes = etree.tostring(lxml_root, encoding="utf-8")
             root = ET.fromstring(xml_bytes)
         except Exception as exc:
-            print(f"  [skip] XML parse error: {exc}")
+            logger.warning("[skip] XML parse error: %s", exc)
             return False
 
     _transform_element(root, root, extra_formats, xhtml_tables, shared_tags)

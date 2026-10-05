@@ -476,14 +476,43 @@ mongo_database = "dgml"
   not define the service itself resolves it from here, so an edit takes effect after
   `dgml workspace reseal <path>` accepts it. A workspace that *does* define
   `[storage.<name>]` in its own config is unaffected — storage does not layer.
+- **Each workspace gets its own namespace in a shared backend.** A bucket or database
+  named in a template is usually shared — by every workspace created from it, and
+  often by other applications. So the S3 and MongoDB stores always put a workspace's
+  data under its **workspace id**, after an optional `prefix` you choose:
+
+  | Backend | `prefix` | Data lands in |
+  |---|---|---|
+  | S3 | not set | `s3://<bucket>/dgml/<id>/files/…` |
+  | S3 | `"contracts"` | `s3://<bucket>/contracts/<id>/files/…` |
+  | MongoDB | not set | collections `dgml_<id>_files`, …, GridFS bucket `dgml_<id>_blobs` |
+  | MongoDB | `"contracts"` | collections `contracts_<id>_files`, …, GridFS bucket `contracts_<id>_blobs` |
+
+  The id is added when the store is opened, not written into config, so `config.toml`
+  holds only the `prefix` you wrote — and a template can be shared by any number of
+  workspaces as it is. It comes from the `workspace_id` in `config.toml`'s
+  `[workspace]` block, which `workspace create` writes and which never changes, so a
+  workspace's data never moves. Local-disk storage is already per-workspace and has no
+  prefix.
 
 ### The `[models]` tiers
 
-The simplest way to configure models is the `[models]` block — four tiers that
-back the per-task models:
+The simplest way to configure models is the `[models]` block. One `family` key
+picks a whole provider family's curated defaults for the four tiers that back
+the per-task models:
 
 ```toml
 [models]
+family = "anthropic_google"   # or anthropic / google / openai
+```
+
+A family-based config *tracks* dgml's shipped defaults — an upgrade may move a
+tier to a newer model. To pin models, set explicit tiers, with or without a
+family (an explicit tier always overrides its family default):
+
+```toml
+[models]
+family   = "anthropic_google"
 light    = "gemini/gemini-flash-lite-latest"  # classification, style
 standard = "anthropic/claude-haiku-4-5"    # transcription, text extraction
 advanced = "anthropic/claude-sonnet-5"     # labeling, value extraction
@@ -497,17 +526,24 @@ falls back to the nearest set tier (nearest lower first, then higher) with a
 warning — so a minimal config that sets only, say, `standard` still resolves
 every task.
 
+`family` is shorthand for its four tiers *within its config layer*: tiers that
+layer leaves unset are filled from the family before the layers merge. So a
+workspace config (or `DGML_MODELS__FAMILY`) setting `family = "openai"` replaces
+explicit tiers in the user config, while tiers set in the same layer as the
+family, or a higher one, still override it. To drop a user-level pin in one
+workspace, restate the family there.
+
 Tiers name only models — they carry no credentials. Credentials are configured
 per task on the task's own section (e.g. `generation.api_key_env`,
 `grounded.schema_api_key`); a model sourced from a tier uses its task section's
 credentials, or falls back to litellm's per-provider env var when the section
 sets none.
 
-`dgml init --provider {anthropic,google,mixed,openai}` writes a ready-made
-`[models]` table; omit `--provider` to auto-detect from the API-key env vars
-that are set (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY` — checked
-in that order, so an OpenAI key never overrides a provider the other two
-already resolve).
+`dgml init --provider {anthropic,anthropic_google,google,openai}` writes a
+family-only `[models]` block; omit `--provider` to auto-detect from the API-key
+env vars that are set (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`
+— checked in that order, so an OpenAI key never overrides a provider the other
+two already resolve).
 
 **Secrets policy.** By default config references API keys via `*_api_key_env`
 env-var-name fields (which store the env var name, not the secret). Every
@@ -565,7 +601,10 @@ profile = "default"
 
 Field rules:
 
-- `provider` — required. `"azure"` or `"aws"`.
+- `provider` — required. A bundled short name (`"azure"`, `"aws"`, `"macos"`)
+  or a dotted `"module.path:ClassName"` naming your own `OcrProvider`
+  subclass. The short names are aliases for the bundled classes' own dotted
+  paths; see [ocr-providers.md](ocr-providers.md).
 - `endpoint` — required for Azure.
 - `api_key` — Azure-only, optional. A literal API key. Mutually
   exclusive with `api_key_env`.
@@ -575,6 +614,9 @@ Field rules:
 - `region` — required for AWS.
 - `profile` — AWS-only, optional. The boto3 profile name from
   `~/.aws/credentials`. When unset, the default credential chain runs.
+
+Every other field is passed to the named provider, which declares the keys it
+accepts and rejects the rest — so a custom provider's options go here too.
 
 ### `grounded` (optional, required for `dgml docset schema generate` / `dgml file extract`)
 
@@ -604,33 +646,57 @@ Field rules:
   its tier; when unset, litellm uses its per-provider env var.
 - `max_tool_iters` — optional positive int, default 20. Cap on
   `get_page_words` tool calls per extraction.
+- `values_reasoning_effort` — optional, default `"medium"`. The reasoning budget
+  of the value-extraction call: one of `"none"`, `"minimal"`, `"low"`,
+  `"medium"`, `"high"`, `"xhigh"` (passed to the provider through litellm), or
+  `"default"` to send no reasoning effort and take the provider's own default.
+  It is the largest cost and latency dial on extraction, and the right setting
+  differs by model. Location grounding is not affected.
 
 ### `generation` (required for `dgml docset generate`)
 
-The two LLMs the PDF→DGML pipeline runs. Each defaults to a tier —
-`model` (per-page **transcription**) ← `standard`, `label_model` (the batch-wide
-**semantic labeling** call) ← `advanced` — so this section is optional. There is
-no CLI flag; the models are a visible config choice. If neither a field nor its
-tier resolves a model, generation fails with `GENERATION_CONFIG_MISSING`.
+The two LLMs the PDF→DGML pipeline runs. Both default to the `standard` tier —
+`model` (per-page **transcription**) and `label_model` (the batch-wide
+**semantic labeling** call) — so this section is optional. There is no CLI
+flag; the models are a visible config choice. If neither a field nor the tier
+resolves a model, generation fails with `GENERATION_CONFIG_MISSING`.
+
+Labeling previously fell back to the `advanced` tier. It no longer does:
+measured over 13 docsets in two independent corpora, 3 draws each, the
+`standard` tier matched or beat `advanced` on every metric while costing about
+half as much, so the stronger tier was not earning its price on this task. Set
+`label_model` explicitly to override.
 
 ```toml
 [generation]
 # Overrides (optional — the tiers cover both by default):
 label_model = "anthropic/claude-opus-5"
+# Anthropic extended thinking for both passes. Default "disabled".
+thinking = "adaptive"
 ```
 
 Field rules:
 
 - `model` — optional; falls back to the `standard` tier. Per-page transcription.
-- `label_model` — optional; falls back to the `advanced` tier. The single
+- `label_model` — optional; falls back to the `standard` tier. The single
   batch-wide semantic-labeling call (also used by the final semantic-link pass
   and `dgml discover`'s semantic filters).
 - Transcription credentials: `api_key` / `api_key_env` / `api_base`.
 - Labeling credentials: `label_api_key` / `label_api_key_env` /
   `label_api_base`. The two models carry **independent** credentials because
-  they may name different providers (e.g. the default `mixed` config transcribes
-  on Anthropic and labels on Gemini). These apply whether the models are set here
+  they may name different providers (e.g. the `anthropic_google` family blends
+  Gemini and Anthropic models). These apply whether the models are set here
   or come from their tiers; when unset, litellm uses its per-provider env var.
+- `thinking` — optional; `"disabled"` (default) or `"adaptive"`. Anthropic
+  extended thinking, applied to **both** passes; ignored for non-Anthropic
+  models. Omitting the field on the wire is not the same as turning thinking
+  off: Claude 4.6+/5 models think adaptively unless told not to, so generation
+  states the mode rather than inheriting it. The default is `"disabled"`
+  because on an internal 5-docset benchmark (three draws per arm, transcription
+  frozen so only labeling varied) it scored higher than adaptive on
+  exact-match and token-overlap F1, individually and pooled, at roughly 2.7x
+  less cost and 4.5x less wall time. Set `"adaptive"` to restore the model
+  default. Any other value fails with `GENERATION_CONFIG_INVALID`.
 
 A malformed section fails the next `docset generate` with
 `GENERATION_CONFIG_INVALID`.

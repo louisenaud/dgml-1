@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +34,7 @@ from dgml_core.hybrid import (
     _raster_page_numbers,
     extract_text_hybrid,
 )
-from dgml_core.ocr import OcrConfig, OcrProvider, OcrProviderName
+from dgml_core.ocr import BUILTIN_OCR_PROVIDERS, OcrConfig, OcrProvider, OcrProviderName
 from dgml_core.storage import Workspace
 from dgml_core.text_extraction import TextMode
 
@@ -116,53 +118,50 @@ def test_iou_partial_overlap() -> None:
     assert iou == pytest.approx(25 / 175)
 
 
+@pytest.fixture(autouse=True)
+def _hybrid_logs_at_info(caplog: pytest.LogCaptureFixture) -> None:
+    """Capture ``dgml_core.hybrid``'s INFO lines — what ``dgml --verbose`` shows."""
+    caplog.set_level(logging.INFO, logger="dgml_core")
+
+
+def _logged(caplog: pytest.LogCaptureFixture) -> str:
+    """Everything logged so far, one message per line, without level prefixes."""
+    return "\n".join(r.getMessage() for r in caplog.records)
+
+
 # ---------------------------------------------------------------------------
 # Merge rules
 # ---------------------------------------------------------------------------
 
 
-def test_merge_default_is_silent(capsys: pytest.CaptureFixture[str]) -> None:
-    """Without ``verbose=True`` (the default), the merge emits nothing on
-    stderr — not even the per-page summary."""
-    digital = [
-        {"t": "stamp", "l": [200, 200, 260, 220]},  # digital-only, would warn
-        {"t": "Hello", "l": [10, 10, 60, 30]},  # very different from OCR, would warn
-    ]
-    ocr = [{"t": "Greetings", "l": [10, 10, 60, 30]}]
-    _merge_words(digital, ocr, file_id="fid", page_num=1)
-    assert capsys.readouterr().err == ""
-
-
-def test_merge_ocr_only_word_kept_and_logged(capsys: pytest.CaptureFixture[str]) -> None:
-    """OCR-only words are always kept, and (under verbose) an info line tells
-    the operator which tokens OCR contributed that digital missed."""
+def test_merge_ocr_only_word_kept_silently(caplog: pytest.LogCaptureFixture) -> None:
+    """OCR-only words are always kept — the default outcome, so nothing is
+    logged for them beyond the per-page summary."""
     digital: list[dict[str, Any]] = []
     ocr = [{"t": "scanned", "l": [10, 10, 60, 30]}]
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=1, verbose=True)
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=1)
     assert merged == ocr
-    err = capsys.readouterr().err
+    err = _logged(caplog)
     assert "warning" not in err  # OCR-only is not a warning condition
-    assert "info" in err
-    assert "'scanned'" in err
-    assert "no matching digital text" in err
+    assert "no matching digital text" not in err
     assert "digital_words=0 ocr_words=1 merged=1" in err
 
 
 def test_merge_same_text_overlap_takes_digital(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Overlap + identical text → take digital (exact character codes)."""
     digital = [{"t": "Hello", "l": [10, 10, 60, 30]}]
     ocr = [{"t": "Hello", "l": [11, 11, 61, 31]}]  # nearly identical bbox
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=1, verbose=True)
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=1)
     assert merged == digital  # digital wins on overlap+similar
-    err = capsys.readouterr().err
+    err = _logged(caplog)
     assert "warning" not in err
     assert "digital_words=1 ocr_words=1 merged=1" in err
 
 
 def test_merge_normalizes_dashes_before_levenshtein(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Dash-family code points are folded to ASCII hyphen-minus before
     measuring distance, so digital ``out<MINUS>of<MINUS>pocket`` and OCR
@@ -178,16 +177,16 @@ def test_merge_normalizes_dashes_before_levenshtein(
 
     digital = [{"t": digital_text, "l": [10, 10, 100, 30]}]
     ocr = [{"t": ocr_text, "l": [11, 11, 101, 31]}]
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=1, verbose=True)
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=1)
     # Digital wins (normalized distance == 0). The original digital text
     # is preserved so downstream consumers see what the PDF actually held.
     assert merged == digital
-    err = capsys.readouterr().err
+    err = _logged(caplog)
     assert "warning" not in err
 
 
 def test_merge_normalizes_all_dash_variants(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Every dash code point in :data:`_DASH_TABLE` folds to ASCII hyphen for
     comparison purposes. Each variant overlapping an ASCII-hyphen OCR word
@@ -202,22 +201,22 @@ def test_merge_normalizes_all_dash_variants(
 
         digital = [{"t": f"a{ch}b", "l": [10, 10, 60, 30]}]
         ocr = [{"t": "a-b", "l": [10, 10, 60, 30]}]
-        merged = _merge_words(digital, ocr, file_id="fid", page_num=1, verbose=True)
+        merged = _merge_words(digital, ocr, file_id="fid", page_num=1)
         assert merged == digital, f"digital should win for U+{cp:04X}"
 
     # All cases should have been silent on the warning channel.
-    assert "warning" not in capsys.readouterr().err
+    assert "warning" not in _logged(caplog)
 
 
 def test_merge_conflicting_text_above_threshold_takes_ocr_warns(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Overlap + Levenshtein > threshold → take OCR with a warning."""
     digital = [{"t": "Hello", "l": [10, 10, 60, 30]}]
     ocr = [{"t": "Greetings", "l": [10, 10, 60, 30]}]  # distance 7
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=1, verbose=True)
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=1)
     assert merged == ocr  # OCR wins on overlap+different
-    err = capsys.readouterr().err
+    err = _logged(caplog)
     assert "'Hello'" in err
     assert "'Greetings'" in err
     assert "using OCR" in err
@@ -225,30 +224,51 @@ def test_merge_conflicting_text_above_threshold_takes_ocr_warns(
 
 
 def test_merge_digital_only_word_is_dropped_with_warning(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A digital word with no overlapping OCR word is assumed invisible-to-
     human-eye and **dropped** (not kept) — but the drop is logged."""
     digital = [{"t": "stamp", "l": [200, 200, 260, 220]}]
     ocr = [{"t": "Hello", "l": [10, 10, 60, 30]}]
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=1, verbose=True)
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=1)
     # The OCR word is kept; the digital-only "stamp" is dropped.
     assert merged == [{"t": "Hello", "l": [10, 10, 60, 30]}]
-    err = capsys.readouterr().err
+    err = _logged(caplog)
     assert "'stamp'" in err
     assert "not detected by OCR" in err
     assert "dropping" in err
 
 
+def test_merge_digital_only_region_drop_is_one_aggregated_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A dropped digital-only region logs ONE line naming a capped sample of
+    its words — a watermark or hidden text layer must not flood the log with
+    a line per word."""
+    from dgml_core.hybrid import _DROP_LOG_SAMPLE
+
+    n = _DROP_LOG_SAMPLE + 3
+    # One tight cluster of overlapping boxes → a single digital-only region.
+    digital = [{"t": f"w{i}", "l": [10, 10, 60, 30]} for i in range(n)]
+    ocr = [{"t": "visible", "l": [500, 500, 560, 520]}]
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=1)
+    assert merged == ocr
+    err = _logged(caplog)
+    assert err.count("dropping") == 1
+    assert f"{n} digital word(s) not detected by OCR" in err
+    assert "'w0'" in err  # sampled tokens are named…
+    assert "(+3 more)" in err  # …and the overflow is a count
+
+
 def test_merge_combination_warns_for_each_problem(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """All four cases mixed on one page.
 
     - OCR ``Hello`` ↔ digital ``Hello`` at same position → digital wins (silent).
     - OCR ``Greetings`` ↔ digital ``world`` at same position, very different →
       OCR wins, one warning.
-    - OCR ``page`` with no digital overlap → OCR kept silently.
+    - OCR ``page`` with no digital overlap → OCR kept, silently (the default).
     - Digital ``stamp`` with no OCR overlap → dropped with a warning.
     """
     digital = [
@@ -261,16 +281,16 @@ def test_merge_combination_warns_for_each_problem(
         {"t": "Greetings", "l": [70, 10, 120, 30]},  # distance 9 — clearly different
         {"t": "page", "l": [200, 200, 240, 220]},  # OCR-only
     ]
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=1, verbose=True)
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=1)
     assert merged == [
         {"t": "Hello", "l": [10, 10, 60, 30]},  # digital, taken on similarity
         {"t": "Greetings", "l": [70, 10, 120, 30]},  # OCR, conflict winner
         {"t": "page", "l": [200, 200, 240, 220]},  # OCR-only
     ]
-    err = capsys.readouterr().err
+    err = _logged(caplog)
     assert err.count("using OCR") == 1  # only the world/Greetings pair
     assert err.count("dropping") == 1  # only "stamp"
-    assert err.count("no matching digital text") == 1  # only "page" (OCR-only)
+    assert "no matching digital text" not in err  # OCR-only "page" is the default
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +311,7 @@ def test_boxes_overlap_coverage_catches_contained_box() -> None:
 
 
 def test_merge_ocr_split_agreeing_keeps_digital_tokens(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """OCR splits a span digital keeps whole; texts agree → keep digital
     (PDF font is more reliable than OCR's tokenization)."""
@@ -300,16 +320,14 @@ def test_merge_ocr_split_agreeing_keeps_digital_tokens(
         {"t": "Analysis)", "l": [813, 2264, 985, 2315]},
         {"t": "Inadequate", "l": [994, 2263, 1230, 2316]},
     ]
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=16, verbose=True)
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=16)
     assert merged == digital  # texts agree → digital wins regardless of token count
-    err = capsys.readouterr().err
-    assert "tokenization mismatch" in err
-    assert "text agrees" in err
-    assert "keeping digital's 1 tokens" in err
+    # Agreement is the designed outcome, so the region logs nothing.
+    assert "tokenization mismatch" not in _logged(caplog)
 
 
 def test_merge_digital_split_agreeing_keeps_digital_tokens(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Digital splits a span OCR keeps whole; texts agree → keep digital."""
     digital = [
@@ -317,14 +335,13 @@ def test_merge_digital_split_agreeing_keeps_digital_tokens(
         {"t": "Inadequate", "l": [994, 2263, 1230, 2316]},
     ]
     ocr = [{"t": "Analysis)Inadequate", "l": [814, 2268, 1229, 2314]}]
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=16, verbose=True)
-    assert merged == digital  # texts agree → digital wins
-    err = capsys.readouterr().err
-    assert "keeping digital's 2 tokens" in err
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=16)
+    assert merged == digital  # texts agree → digital wins, silently
+    assert "tokenization mismatch" not in _logged(caplog)
 
 
 def test_merge_split_tie_goes_to_digital(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Equal token counts in a mixed region with agreeing text → digital."""
     # Identical boxes force a single 2-vs-2 region.
@@ -332,14 +349,13 @@ def test_merge_split_tie_goes_to_digital(
     digital = [{"t": "AB", "l": box}, {"t": "CD", "l": box}]
     ocr = [{"t": "AC", "l": box}, {"t": "BD", "l": box}]
     # Concats "ABCD" vs "ACBD" — distance 2, within threshold → "agree".
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=1, verbose=True)
-    assert merged == digital  # 2 == 2 tie → digital
-    err = capsys.readouterr().err
-    assert "keeping digital's 2 tokens" in err
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=1)
+    assert merged == digital  # 2 == 2 tie → digital, silently (text agrees)
+    assert "tokenization mismatch" not in _logged(caplog)
 
 
 def test_merge_split_disagreeing_takes_ocr(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Mixed region whose concatenations differ beyond threshold → OCR, even
     though digital here has fewer tokens."""
@@ -348,23 +364,23 @@ def test_merge_split_disagreeing_takes_ocr(
         {"t": "XYZ", "l": [0, 0, 40, 10]},
         {"t": "WVUT", "l": [40, 0, 80, 10]},
     ]
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=1, verbose=True)
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=1)
     assert merged == ocr
-    err = capsys.readouterr().err
+    err = _logged(caplog)
     assert "text differs" in err
     assert "keeping OCR's 2 tokens" in err
 
 
 def test_merge_dollar_blanks_vs_ocr_dollar_takes_ocr(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Real 1:1-via-coverage case: digital captured fill-in underscores OCR
     didn't see. Boxes overlap by containment; texts differ → OCR's '$'."""
     digital = [{"t": '$_____."', "l": [1454, 123, 1635, 169]}]
     ocr = [{"t": "$", "l": [1455, 120, 1481, 170]}]
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=1, verbose=True)
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=1)
     assert merged == ocr
-    err = capsys.readouterr().err
+    err = _logged(caplog)
     assert "using OCR" in err
 
 
@@ -394,29 +410,29 @@ def test_levenshtein_insertion_deletion() -> None:
 
 
 def test_merge_levenshtein_boundary_at_threshold_takes_digital(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Distance == threshold counts as similar — digital wins."""
     digital = [{"t": "Hello", "l": [10, 10, 60, 30]}]
     ocr = [{"t": "He11o", "l": [10, 10, 60, 30]}]  # distance 2
     assert _levenshtein_distance("Hello", "He11o") == LEVENSHTEIN_THRESHOLD
 
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=1, verbose=True)
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=1)
     assert merged == digital
-    assert "warning" not in capsys.readouterr().err
+    assert "warning" not in _logged(caplog)
 
 
 def test_merge_levenshtein_just_over_threshold_takes_ocr(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Distance == threshold + 1 → OCR wins with a warning."""
     digital = [{"t": "Hello", "l": [10, 10, 60, 30]}]
     ocr = [{"t": "He11x", "l": [10, 10, 60, 30]}]  # distance 3
     assert _levenshtein_distance("Hello", "He11x") == LEVENSHTEIN_THRESHOLD + 1
 
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=1, verbose=True)
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=1)
     assert merged == ocr
-    err = capsys.readouterr().err
+    err = _logged(caplog)
     assert "using OCR" in err
     assert f"levenshtein={LEVENSHTEIN_THRESHOLD + 1}" in err
 
@@ -427,7 +443,7 @@ def test_merge_levenshtein_just_over_threshold_takes_ocr(
 
 
 def test_merge_cid_guard_falls_back_to_ocr_only(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """When pdfminer couldn't resolve glyphs to Unicode (lots of '(cid:N)'
     tokens), the digital output is unusable. The merge logs a 'unicode
@@ -443,17 +459,16 @@ def test_merge_cid_guard_falls_back_to_ocr_only(
         {"t": "scanned", "l": [10, 10, 60, 30]},
         {"t": "page", "l": [70, 10, 110, 30]},
     ]
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=7, verbose=True)
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=7)
     assert merged == ocr
-    err = capsys.readouterr().err
+    err = _logged(caplog)
     assert "unicode error" in err
     assert "page=7" in err
     assert f"{MAX_CID_WORDS_PER_PAGE + 1} words containing '(cid:'" in err
-    assert "cid_guard=true" in err
 
 
 def test_merge_cid_guard_below_threshold_does_not_trigger(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """At-or-below ``MAX_CID_WORDS_PER_PAGE`` is tolerated — the normal merge
     runs and individual cid words are subject to the regular rules."""
@@ -462,11 +477,11 @@ def test_merge_cid_guard_below_threshold_does_not_trigger(
         for i in range(MAX_CID_WORDS_PER_PAGE)
     ]
     ocr = [{"t": "scanned", "l": [500, 500, 560, 520]}]
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=1, verbose=True)
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=1)
     # The cid tokens are digital-only (no OCR overlap) so they all drop.
     # The OCR word stays.
     assert merged == ocr
-    err = capsys.readouterr().err
+    err = _logged(caplog)
     assert "unicode error" not in err
 
 
@@ -573,47 +588,47 @@ def test_raster_page_numbers_on_unparseable_pdf_is_empty(tmp_path: Path) -> None
 
 
 def test_merge_scan_guard_drops_the_baked_layer(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The baked layer's `402` would otherwise overrule OCR's `.02` — the two
     are one edit apart, so the mixed-region rule calls them the same word."""
     digital = [{"t": "402", "l": [100, 10, 140, 30]}]
     ocr = [{"t": ".02", "l": [102, 10, 142, 30]}]
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=3, raster_page=True, verbose=True)
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=3, raster_page=True)
     assert merged == ocr
-    err = capsys.readouterr().err
+    err = _logged(caplog)
     assert "scan guard" in err
     assert "page=3" in err
-    assert "scan_guard=true" in err
+    assert "using OCR for the entire page" in err
 
 
 def test_merge_without_scan_guard_keeps_the_baked_layer(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The same region on a page that is NOT a scan: digital still wins, which
     is what makes the guard the thing that has to notice."""
     digital = [{"t": "402", "l": [100, 10, 140, 30]}]
     ocr = [{"t": ".02", "l": [102, 10, 142, 30]}]
-    merged = _merge_words(digital, ocr, file_id="fid", page_num=3, verbose=True)
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=3)
     assert merged == digital
-    assert "scan guard" not in capsys.readouterr().err
+    assert "scan guard" not in _logged(caplog)
 
 
 def test_merge_scan_guard_silent_when_page_has_no_digital_text(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A scan with no baked layer needs no guard — the merge already yields
     OCR — so it says nothing."""
     ocr = [{"t": "scanned", "l": [10, 10, 60, 30]}]
-    merged = _merge_words([], ocr, file_id="fid", page_num=1, raster_page=True, verbose=True)
+    merged = _merge_words([], ocr, file_id="fid", page_num=1, raster_page=True)
     assert merged == ocr
-    assert "scan guard" not in capsys.readouterr().err
+    assert "scan guard" not in _logged(caplog)
 
 
 def test_extract_text_hybrid_scan_guard_end_to_end(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A scanned PDF's baked text never reaches page_text: the output is the
     OCR words alone, even where a baked word sits right on top of one."""
@@ -626,13 +641,11 @@ def test_extract_text_hybrid_scan_guard_end_to_end(
         words_by_page={1: [{"t": "baked!", "l": [100, 70, 190, 100]}]},
     )
     out_dir = tmp_path / "page_text"
-    cfg = OcrConfig(provider=OcrProviderName.AZURE, endpoint="https://x/")
-    extract_text_hybrid(
-        pdf, out_dir, file_id="fid", page_images_dir=pages_dir, config=cfg, verbose=True
-    )
+    cfg = OcrConfig(provider=OcrProviderName.AZURE, options={"endpoint": "https://x/"})
+    extract_text_hybrid(pdf, out_dir, file_id="fid", page_images_dir=pages_dir, config=cfg)
     words = json.loads((out_dir / "page_1.json").read_text())["words"]
     assert [w["t"] for w in words] == ["baked!"]
-    assert "scan_guard=true" in capsys.readouterr().err
+    assert "scan guard" in _logged(caplog)
 
 
 # ---------------------------------------------------------------------------
@@ -647,12 +660,14 @@ def _install_fake_provider(
     fail_on_page: int | None = None,
 ) -> None:
     class FakeProvider(OcrProvider):
-        name = OcrProviderName.AZURE
-        config_fields = frozenset[str]()
+        name = OcrProviderName.AZURE.value
+        # Stands in for Azure, so it declares Azure's option: the framework rejects
+        # anything a provider doesn't name, whether or not parse_config checks.
+        config_fields = frozenset({"endpoint"})
 
         @classmethod
-        def parse_config(cls, section: dict[str, Any]) -> OcrConfig:
-            return OcrConfig(provider=cls.name)
+        def parse_config(cls, config: OcrConfig) -> OcrConfig:
+            return config
 
         def __init__(self, config: OcrConfig) -> None:
             self.config = config
@@ -669,9 +684,13 @@ def _install_fake_provider(
                 return []
             return list(words_by_page.get(page_num, []))
 
-    from dgml_core.ocr import _PROVIDERS
-
-    monkeypatch.setitem(_PROVIDERS, OcrProviderName.AZURE, FakeProvider)
+    # Repoint the "azure" alias at the fake rather than reaching into a registry:
+    # these tests drive the workspace config, which says provider = "azure", so the
+    # real resolver still runs end to end.
+    monkeypatch.setattr(sys.modules[__name__], "FakeProvider", FakeProvider, raising=False)
+    monkeypatch.setitem(
+        BUILTIN_OCR_PROVIDERS, OcrProviderName.AZURE.value, f"{__name__}:FakeProvider"
+    )
 
 
 def _seed_page_images(pages_dir: Path, n: int, w: int = 612, h: int = 792) -> None:
@@ -684,7 +703,7 @@ def test_extract_text_hybrid_merges_per_page_and_writes_output(
     text_pdf: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """End-to-end: real digital extraction from a fixture PDF, fake OCR words.
     OCR words land in the output; digital words with no OCR overlap are
@@ -705,9 +724,9 @@ def test_extract_text_hybrid_merges_per_page_and_writes_output(
     )
 
     out_dir = tmp_path / "page_text"
-    cfg = OcrConfig(provider=OcrProviderName.AZURE, endpoint="https://x/")
+    cfg = OcrConfig(provider=OcrProviderName.AZURE, options={"endpoint": "https://x/"})
     result = extract_text_hybrid(
-        text_pdf, out_dir, file_id="fid", page_images_dir=pages_dir, config=cfg, verbose=True
+        text_pdf, out_dir, file_id="fid", page_images_dir=pages_dir, config=cfg
     )
 
     assert result.pages_written == 2
@@ -723,7 +742,7 @@ def test_extract_text_hybrid_merges_per_page_and_writes_output(
 
     # Each digital word with no OCR overlap should have produced a "dropping"
     # warning on stderr.
-    err = capsys.readouterr().err
+    err = _logged(caplog)
     for token in ("Hello", "World", "Second", "Page", "Text"):
         assert f"'{token}'" in err
     assert "dropping" in err
@@ -732,7 +751,7 @@ def test_extract_text_hybrid_merges_per_page_and_writes_output(
 def test_extract_text_hybrid_continues_when_digital_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """If pdfminer cannot parse the PDF, hybrid logs a stderr warning and
     proceeds with OCR-only output rather than aborting."""
@@ -748,20 +767,19 @@ def test_extract_text_hybrid_continues_when_digital_fails(
     )
 
     out_dir = tmp_path / "page_text"
-    cfg = OcrConfig(provider=OcrProviderName.AZURE, endpoint="https://x/")
+    cfg = OcrConfig(provider=OcrProviderName.AZURE, options={"endpoint": "https://x/"})
     result = extract_text_hybrid(
         broken_pdf,
         out_dir,
         file_id="fid",
         page_images_dir=pages_dir,
         config=cfg,
-        verbose=True,
     )
 
     assert result.pages_written == 1
     page1 = json.loads((out_dir / "page_1.json").read_text())
     assert [w["t"] for w in page1["words"]] == ["scanned"]
-    assert "digital extraction failed" in capsys.readouterr().err
+    assert "digital extraction failed" in _logged(caplog)
 
 
 def test_extract_text_hybrid_propagates_ocr_failure(
@@ -771,7 +789,7 @@ def test_extract_text_hybrid_propagates_ocr_failure(
     _seed_page_images(pages_dir, n=2)
     _install_fake_provider(monkeypatch, fail_on_page=1)
 
-    cfg = OcrConfig(provider=OcrProviderName.AZURE, endpoint="https://x/")
+    cfg = OcrConfig(provider=OcrProviderName.AZURE, options={"endpoint": "https://x/"})
     out_dir = tmp_path / "page_text"
     with pytest.raises(OcrFailed):
         extract_text_hybrid(text_pdf, out_dir, file_id="fid", page_images_dir=pages_dir, config=cfg)
@@ -903,9 +921,9 @@ def test_llm_not_called_for_identical_tokens(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_llm_verbose_logs_accepted_text(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The per-region verbose line includes the final accepted token text."""
+    """The per-region INFO line includes the final accepted token text."""
     _install_fake_call(monkeypatch, lambda c: [{"ref": c["digital"][0]["id"], "t": "file"}])
     digital = [{"t": "ﬁle", "l": [10, 10, 40, 30]}]
     ocr = [{"t": "file", "l": [11, 11, 41, 31]}]
@@ -915,9 +933,8 @@ def test_llm_verbose_logs_accepted_text(
         file_id="fid",
         page_num=1,
         text_extraction_config=_LLM_CONFIG,
-        verbose=True,
     )
-    err = capsys.readouterr().err
+    err = _logged(caplog)
     assert "LLM resolved" in err
     assert "'file'" in err  # the accepted token text is surfaced
     assert "digital=['ﬁle']" in err  # original digital text
@@ -1012,7 +1029,7 @@ def test_llm_missing_region_id_falls_back(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_llm_failed_merge_logs_raw_output(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A failed merge logs the raw model output so truncation is diagnosable."""
     _install_fake_call(monkeypatch, lambda c: [], raw="not json {{{")
@@ -1024,9 +1041,8 @@ def test_llm_failed_merge_logs_raw_output(
         file_id="fid",
         page_num=1,
         text_extraction_config=_LLM_CONFIG,
-        verbose=True,
     )
-    err = capsys.readouterr().err
+    err = _logged(caplog)
     assert "LLM merge failed" in err
     assert "raw output was:" in err
     assert "not json {{{" in err  # the verbatim reply is surfaced
