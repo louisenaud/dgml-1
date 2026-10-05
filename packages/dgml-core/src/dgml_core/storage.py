@@ -25,6 +25,9 @@ from typing import TYPE_CHECKING, Any
 from . import layout
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from .migrations import MigrationResult
     from .storage_service import BlobStore, DocStore, StorageConfig
 
 from .default_config import PROVIDER_MODELS
@@ -95,6 +98,58 @@ class Workspace:
         else:
             root = (Path.cwd() / DEFAULT_DIR_NAME).resolve()
         return cls(root=root, config_override=config)
+
+    @classmethod
+    def open(
+        cls,
+        override: Path | str | None = None,
+        *,
+        config: Path | None = None,
+        on_migration: Callable[[Workspace, MigrationResult], None] | None = None,
+    ) -> Workspace:
+        """Resolve a workspace **and bring it up to date** — the entry point for
+        anything that goes on to read or write one.
+
+        :meth:`resolve` only answers "which workspace" and does not touch it, which
+        makes it right for the commands that run *before* a workspace is usable
+        (``workspace create``, ``workspace reseal``) and wrong for everything else.
+
+        Four steps, in the only order that works:
+
+        1. ``migrate_workspace_config`` — moves a legacy storage binding into the
+           workspace's own config. **First**: everything after it reads the store,
+           and until this runs, that store is the wrong one.
+        2. ``verify_storage_fingerprint`` — before any store is built, so a drifted
+           ``[storage]`` raises rather than opening an empty backend.
+        3. ``is_initialized()`` — which *is* "has a config".
+        4. ``migrate_workspace`` — upgrades the layout; a no-op read when current.
+
+        ``on_migration`` fires per migration that **changed** something, with the
+        workspace it changed. Ignoring it is a reasonable default.
+        """
+        # Imported here, not at module scope: both modules import this one.
+        from .errors import WorkspaceNotInitialized
+        from .migrations import migrate_workspace, migrate_workspace_config
+        from .storage_resolve import verify_storage_fingerprint
+
+        ws = cls.resolve(override, config=config)
+        migrate_workspace_config(ws)
+        verify_storage_fingerprint(ws)
+        if not ws.is_initialized():
+            where = (
+                f"{ws.config_location} holds no config for {ws.workspaces_id}"
+                if ws.workspaces_id is not None
+                else f"no workspace at {ws.root}: {ws.config_path} is missing"
+            )
+            raise WorkspaceNotInitialized(
+                f"{where}. The config names the storage backend and cannot be "
+                f"reconstructed; restore it from backup, or create the workspace.",
+                workspace=ws,
+            )
+        for result in migrate_workspace(ws):
+            if result.changed and on_migration is not None:
+                on_migration(ws, result)
+        return ws
 
     @classmethod
     def _from_workspaces_store(cls, value: str, config: Path | None) -> Workspace | None:

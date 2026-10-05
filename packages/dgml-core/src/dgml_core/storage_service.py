@@ -76,9 +76,11 @@ class StorageConfig:
     ``provider`` is the dotted path identifying the store class. ``options`` holds
     the section's remaining (non-``provider``) fields verbatim — a provider's own
     settings (``bucket``, ``endpoint_url``, ``mongo_database``, …). ``root`` is the
-    local workspace root, always available as bootstrap (the config names the store,
-    so it cannot live inside it); a ``LocalStore`` writes under it, and a remote
-    store may use it for temp staging.
+    local workspace root, resolved per invocation rather than read from config (the
+    config names the store, so it cannot live inside it). It is ``LocalStore``'s data
+    location and nothing more: a remote store has no use for it, and it is **not** a
+    scratch location — staging goes through ``tempfile`` and ``$TMPDIR`` (see the path
+    bridge on :class:`BlobStore`).
     """
 
     provider: str
@@ -187,10 +189,20 @@ class BlobStore(_StoreBase):
     # already *is* an on-disk path), keeping local I/O byte-for-byte identical to
     # the pre-store code.
     #
-    # A remote store overriding these should stage under ``StorageConfig.root``
-    # rather than the default ``tempfile`` location: ``TMPDIR`` is a RAM-backed
-    # tmpfs on many container images, which would silently turn a bounded-memory
-    # read back into a whole-blob allocation plus a copy.
+    # These stage through the ordinary ``tempfile`` location — staging is a property of
+    # the deployment, not of a workspace, so there is no dgml-specific setting and
+    # ``StorageConfig.root`` is not involved. Python picks the directory in this order:
+    #
+    #   1. ``$TMPDIR``   — the one an operator sets
+    #   2. ``$TEMP``, then ``$TMP``
+    #   3. ``/tmp``, ``/var/tmp``, ``/usr/tmp``
+    #   4. the current working directory
+    #
+    # Point ``TMPDIR`` at real disk on a container image: it is RAM-backed tmpfs on Cloud
+    # Run, on ``emptyDir: {medium: Memory}`` and by default on Fedora/RHEL/Arch, and
+    # ``staged_write`` below holds a whole batch before uploading any of it. It must be
+    # set before the process starts — Python memoizes ``gettempdir()`` on first call.
+    # (``LocalStore`` overrides these four and stages in ``<root>/.cache/staging``.)
 
     @contextmanager
     def materialize(self, key: str) -> Iterator[Path]:

@@ -29,6 +29,7 @@ from dgml_core.hybrid import (
     _iou,
     _levenshtein_distance,
     _merge_words,
+    _raster_page_numbers,
     extract_text_hybrid,
 )
 from dgml_core.ocr import OcrConfig, OcrProvider, OcrProviderName
@@ -40,6 +41,60 @@ from .conftest import make_fake_png, write_ocr_config
 # ---------------------------------------------------------------------------
 # IoU sanity
 # ---------------------------------------------------------------------------
+
+
+def _write_page(dir_: Path, page: int, payload: dict[str, Any]) -> None:
+    dir_.mkdir(parents=True, exist_ok=True)
+    (dir_ / f"page_{page}.json").write_text(json.dumps(payload))
+
+
+def test_merge_rotates_digital_into_deskewed_frame(tmp_path: Path) -> None:
+    """On a deskewed OCR page, the digital boxes (still in the original render's
+    frame) are rotated by the same transform and then merged normally — so
+    high-fidelity digital text survives on rotated pages instead of being
+    dropped. Here a 180° rotation maps the digital box onto the matching OCR
+    box, so digital wins on agreement and its (rotated) box is what's emitted."""
+    from dgml_core.hybrid import _merge_into
+
+    digital_dir = tmp_path / "digital"
+    ocr_dir = tmp_path / "ocr"
+    out_dir = tmp_path / "out"
+
+    # Digital saw the word in the ORIGINAL (pre-rotation) frame.
+    _write_page(
+        digital_dir,
+        1,
+        {
+            "file_id": "fid",
+            "page": 1,
+            "width": 100,
+            "height": 60,
+            "words": [{"t": "hello", "l": [10, 10, 30, 20]}],
+        },
+    )
+    # OCR deskewed the page 180°; its word sits where the digital word lands
+    # after the same 180° rotation about the page centre: [70, 40, 90, 50].
+    _write_page(
+        ocr_dir,
+        1,
+        {
+            "file_id": "fid",
+            "page": 1,
+            "width": 100,
+            "height": 60,
+            "words": [{"t": "hello", "l": [70, 40, 90, 50]}],
+            "rotation": 180.0,
+        },
+    )
+
+    _merge_into(digital_dir, ocr_dir, out_dir, file_id="fid")
+
+    payload = json.loads((out_dir / "page_1.json").read_text())
+    # Digital was rotated to [70, 40, 90, 50], overlaps the identical-text OCR
+    # word, so digital wins on agreement — one word, at the rotated position.
+    assert payload["words"] == [{"t": "hello", "l": [70, 40, 90, 50]}]
+    assert payload["rotation"] == 180.0
+    assert (payload["width"], payload["height"]) == (100, 60)
 
 
 def test_iou_identical_boxes_is_one() -> None:
@@ -413,6 +468,171 @@ def test_merge_cid_guard_below_threshold_does_not_trigger(
     assert merged == ocr
     err = capsys.readouterr().err
     assert "unicode error" not in err
+
+
+# ---------------------------------------------------------------------------
+# Scan guard: a full-page raster image means the digital text is a baked-in
+# OCR layer, not the document's own character codes
+# ---------------------------------------------------------------------------
+
+
+def _write_scanned_pdf(path: Path, *, pages: int, image_scale: float, text: str) -> None:
+    """Write a PDF whose every page paints one image scaled to ``image_scale``
+    of the page in each dimension, then draws ``text`` over it.
+
+    ``image_scale=0.9`` models a scan (the picture IS the page); a small value
+    models a born-digital page carrying a logo. The image is a 2x2 grey JPEG-
+    free raw sample, big enough for pdfminer to report a bbox and nothing more
+    — the merge never looks at pixels, only at how much of the page they cover.
+    """
+    out = bytearray()
+    offsets: list[int] = []
+
+    def add_object(body: bytes) -> int:
+        offsets.append(len(out))
+        obj_num = len(offsets)
+        out.extend(f"{obj_num} 0 obj\n".encode())
+        out.extend(body)
+        out.extend(b"\nendobj\n")
+        return obj_num
+
+    out.extend(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    width, height = 612, 792
+    draw_w, draw_h = width * image_scale, height * image_scale
+
+    catalog_id, pages_id, font_id = 1, 2, 3
+    image_id = 4
+    page_obj_ids = list(range(image_id + 1, image_id + 1 + pages))
+    content_obj_ids = list(range(page_obj_ids[-1] + 1, page_obj_ids[-1] + 1 + pages))
+
+    add_object(f"<< /Type /Catalog /Pages {pages_id} 0 R >>".encode())
+    kids = " ".join(f"{pid} 0 R" for pid in page_obj_ids)
+    add_object(f"<< /Type /Pages /Kids [{kids}] /Count {pages} >>".encode())
+    add_object(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+
+    pixels = bytes([200, 200, 200, 200])
+    img = (
+        b"<< /Type /XObject /Subtype /Image /Width 2 /Height 2 "
+        b"/ColorSpace /DeviceGray /BitsPerComponent 8 /Length 4 >>\nstream\n"
+        + pixels
+        + b"\nendstream"
+    )
+    assert add_object(img) == image_id
+
+    for page_id, content_id in zip(page_obj_ids, content_obj_ids, strict=True):
+        body = (
+            f"<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {width} {height}] "
+            f"/Contents {content_id} 0 R /Resources << /Font << /F1 {font_id} 0 R >> "
+            f"/XObject << /Im0 {image_id} 0 R >> >> >>"
+        ).encode()
+        assert add_object(body) == page_id
+
+    for content_id in content_obj_ids:
+        stream_body = (
+            f"q {draw_w:.2f} 0 0 {draw_h:.2f} 0 0 cm /Im0 Do Q\n"
+            f"BT /F1 24 Tf 100 700 Td ({text}) Tj ET\n"
+        ).encode()
+        body = f"<< /Length {len(stream_body)} >>\nstream\n".encode() + stream_body + b"endstream"
+        assert add_object(body) == content_id
+
+    xref_offset = len(out)
+    n_objects = len(offsets)
+    out.extend(f"xref\n0 {n_objects + 1}\n".encode())
+    out.extend(b"0000000000 65535 f \n")
+    for off in offsets:
+        out.extend(f"{off:010d} 00000 n \n".encode())
+    out.extend(
+        (
+            f"trailer\n<< /Size {n_objects + 1} /Root {catalog_id} 0 R >>\n"
+            f"startxref\n{xref_offset}\n%%EOF\n"
+        ).encode()
+    )
+    path.write_bytes(bytes(out))
+
+
+def test_raster_page_numbers_finds_full_page_image(tmp_path: Path) -> None:
+    pdf = tmp_path / "scan.pdf"
+    _write_scanned_pdf(pdf, pages=2, image_scale=0.9, text="baked in")
+    assert _raster_page_numbers(pdf) == {1, 2}
+
+
+def test_raster_page_numbers_ignores_a_small_image(tmp_path: Path) -> None:
+    """A born-digital page's own artwork covers a few percent of the page, not
+    most of it, so its high-fidelity text layer keeps winning regions."""
+    pdf = tmp_path / "logo.pdf"
+    _write_scanned_pdf(pdf, pages=1, image_scale=0.1, text="native text")
+    assert _raster_page_numbers(pdf) == set()
+
+
+def test_raster_page_numbers_on_unparseable_pdf_is_empty(tmp_path: Path) -> None:
+    """Never fail ingest over the probe: an unreadable PDF just merges the old
+    way."""
+    pdf = tmp_path / "broken.pdf"
+    pdf.write_bytes(b"not a pdf at all")
+    assert _raster_page_numbers(pdf) == set()
+
+
+def test_merge_scan_guard_drops_the_baked_layer(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The baked layer's `402` would otherwise overrule OCR's `.02` — the two
+    are one edit apart, so the mixed-region rule calls them the same word."""
+    digital = [{"t": "402", "l": [100, 10, 140, 30]}]
+    ocr = [{"t": ".02", "l": [102, 10, 142, 30]}]
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=3, raster_page=True, verbose=True)
+    assert merged == ocr
+    err = capsys.readouterr().err
+    assert "scan guard" in err
+    assert "page=3" in err
+    assert "scan_guard=true" in err
+
+
+def test_merge_without_scan_guard_keeps_the_baked_layer(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The same region on a page that is NOT a scan: digital still wins, which
+    is what makes the guard the thing that has to notice."""
+    digital = [{"t": "402", "l": [100, 10, 140, 30]}]
+    ocr = [{"t": ".02", "l": [102, 10, 142, 30]}]
+    merged = _merge_words(digital, ocr, file_id="fid", page_num=3, verbose=True)
+    assert merged == digital
+    assert "scan guard" not in capsys.readouterr().err
+
+
+def test_merge_scan_guard_silent_when_page_has_no_digital_text(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A scan with no baked layer needs no guard — the merge already yields
+    OCR — so it says nothing."""
+    ocr = [{"t": "scanned", "l": [10, 10, 60, 30]}]
+    merged = _merge_words([], ocr, file_id="fid", page_num=1, raster_page=True, verbose=True)
+    assert merged == ocr
+    assert "scan guard" not in capsys.readouterr().err
+
+
+def test_extract_text_hybrid_scan_guard_end_to_end(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A scanned PDF's baked text never reaches page_text: the output is the
+    OCR words alone, even where a baked word sits right on top of one."""
+    pdf = tmp_path / "scan.pdf"
+    _write_scanned_pdf(pdf, pages=1, image_scale=0.9, text="baked")
+    pages_dir = tmp_path / "page_images"
+    _seed_page_images(pages_dir, n=1)
+    _install_fake_provider(
+        monkeypatch,
+        words_by_page={1: [{"t": "baked!", "l": [100, 70, 190, 100]}]},
+    )
+    out_dir = tmp_path / "page_text"
+    cfg = OcrConfig(provider=OcrProviderName.AZURE, endpoint="https://x/")
+    extract_text_hybrid(
+        pdf, out_dir, file_id="fid", page_images_dir=pages_dir, config=cfg, verbose=True
+    )
+    words = json.loads((out_dir / "page_1.json").read_text())["words"]
+    assert [w["t"] for w in words] == ["baked!"]
+    assert "scan_guard=true" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

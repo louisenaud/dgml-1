@@ -132,9 +132,7 @@ class LocalStore(BlobStore, DocStore):
     ``[storage]`` key on purpose: where files sit is a local-disk concern, so a
     ``workspace_path`` under an S3 or Mongo table is rejected automatically by
     :meth:`~dgml_core.provider.ProviderConfigFields._check_no_extra_fields`, with no
-    "only applies when the provider is local" special case anywhere. See issue #129 for
-    where this is heading — ``StorageConfig.root`` is required of every provider and read
-    only by this one.
+    "only applies when the provider is local" special case anywhere.
     """
 
     name = "local"

@@ -49,7 +49,7 @@ import struct
 import sys
 import warnings
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, ClassVar
@@ -59,6 +59,7 @@ from .config import load_merged_config
 from .errors import OcrConfigInvalid, OcrConfigMissing, OcrFailed
 from .models_config import ConfigSection
 from .pages import PAGE_GLOB
+from .rotation import deskew_page, should_rotate
 from .storage import Workspace
 from .text_extraction import (
     PAGE_TEXT_FILENAME,
@@ -66,7 +67,11 @@ from .text_extraction import (
     ExtractDigitalResult,
 )
 
-DEFAULT_OCR_CONCURRENCY = 8
+# Pages within a file are OCR'd concurrently (one provider call per page). This
+# is the default number of in-flight OCR calls; override per workspace with
+# ``ocr.max_concurrency`` in config.json. Kept modest so bulk ingestion stays
+# under cloud-provider rate limits.
+DEFAULT_OCR_CONCURRENCY = 5
 
 
 class OcrProviderName(StrEnum):
@@ -99,6 +104,8 @@ class OcrConfig:
     # AWS
     region: str | None = None
     profile: str | None = None
+    # Universal: number of pages OCR'd concurrently (in-flight provider calls).
+    max_concurrency: int = DEFAULT_OCR_CONCURRENCY
 
 
 def load_ocr_config(workspace: Workspace) -> OcrConfig:
@@ -130,7 +137,19 @@ def load_ocr_config(workspace: Workspace) -> OcrConfig:
         )
     provider_name = OcrProviderName(provider_str)
 
-    return _PROVIDERS[provider_name].parse_config(ocr)
+    cfg = _PROVIDERS[provider_name].parse_config(ocr)
+    return replace(cfg, max_concurrency=_parse_max_concurrency(ocr))
+
+
+def _parse_max_concurrency(ocr: dict[str, Any]) -> int:
+    """Read the optional universal ``ocr.max_concurrency`` (a positive int),
+    defaulting to :data:`DEFAULT_OCR_CONCURRENCY`."""
+    raw = ocr.get("max_concurrency")
+    if raw is None:
+        return DEFAULT_OCR_CONCURRENCY
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw < 1:
+        raise OcrConfigInvalid(f"'ocr.max_concurrency' must be a positive integer (got {raw!r})")
+    return raw
 
 
 def _default_ocr_config() -> OcrConfig:
@@ -163,6 +182,38 @@ def _default_ocr_config() -> OcrConfig:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class OcrPageResult:
+    """A provider's OCR output for one rendered page image.
+
+    ``words`` is the token list (``[{t, l:[left,top,right,bottom]}]``) — the
+    same shape :meth:`OcrProvider.analyze_image` has always returned. ``angle``
+    is the page-content skew the provider reported, in degrees, clockwise-
+    positive (Azure DI's ``page.angle`` convention). ``0.0`` means "no skew" or
+    "this provider doesn't report skew". A significant angle drives deskew of
+    the page image and word boxes in :func:`extract_text_ocr`.
+
+    Providers may still return a bare ``list`` of word dicts from
+    ``analyze_image`` (treated as ``angle=0.0``); this dataclass is the richer
+    form used by providers that report skew.
+    """
+
+    words: list[dict[str, Any]]
+    angle: float = 0.0
+
+
+def _as_page_result(ret: list[dict[str, Any]] | OcrPageResult) -> OcrPageResult:
+    """Normalise an ``analyze_image`` return into an :class:`OcrPageResult`.
+
+    Accepts either the richer dataclass or a bare word list (angle 0), so
+    providers that don't report skew — and the fakes in the test-suite — need
+    no changes.
+    """
+    if isinstance(ret, OcrPageResult):
+        return ret
+    return OcrPageResult(words=ret, angle=0.0)
+
+
 class OcrProvider(ABC):
     """Common interface for cloud OCR backends.
 
@@ -186,7 +237,7 @@ class OcrProvider(ABC):
     def _check_no_extra_fields(cls, section: dict[str, Any]) -> None:
         """Raise :class:`OcrConfigInvalid` for any keys in ``section`` not
         in ``cls.config_fields`` (or the universal ``provider``)."""
-        allowed = cls.config_fields | {"provider"}
+        allowed = cls.config_fields | {"provider", "max_concurrency"}
         unknown = set(section.keys()) - allowed
         if unknown:
             raise OcrConfigInvalid(
@@ -220,8 +271,15 @@ class OcrProvider(ABC):
         image_bytes: bytes,
         image_dims_px: tuple[int, int],
         page_num: int,
-    ) -> list[dict[str, Any]]:
-        """Return ``[{t: text, l: [left, top, right, bottom]}]`` for the image.
+    ) -> list[dict[str, Any]] | OcrPageResult:
+        """Return the words found in the image (and, optionally, its skew).
+
+        Return either a bare ``[{t: text, l: [left, top, right, bottom]}]``
+        list (the historical shape; skew assumed 0) or an
+        :class:`OcrPageResult` carrying the same words plus the page-content
+        ``angle`` in degrees (clockwise-positive) for providers that report
+        skew. When the angle is significant the shared loop deskews the page
+        image and rotates these boxes to match (see :func:`extract_text_ocr`).
 
         Coordinates are in pixels relative to ``image_dims_px`` (top-left
         origin). Implementations may use or ignore ``image_dims_px``
@@ -249,7 +307,7 @@ def extract_text_ocr(
     file_id: str,
     page_images_dir: Path,
     config: OcrConfig,
-    max_concurrency: int = DEFAULT_OCR_CONCURRENCY,
+    max_concurrency: int | None = None,
 ) -> ExtractDigitalResult:
     """Run OCR using the configured provider and write per-page JSONs.
 
@@ -269,7 +327,9 @@ def extract_text_ocr(
     :func:`extract_text_digital` but is not opened here.
 
     Pages are dispatched via :func:`dgml_core.concurrency.map_concurrent`
-    with up to ``max_concurrency`` workers. The provider's
+    with up to ``max_concurrency`` workers (when ``None``,
+    ``config.max_concurrency`` — set by ``ocr.max_concurrency`` in
+    config.json, default :data:`DEFAULT_OCR_CONCURRENCY`). The provider's
     ``analyze_image`` is therefore called from multiple threads; both
     shipped providers wrap stateless API calls that are safe to invoke
     concurrently against the same underlying SDK client. On the first
@@ -284,6 +344,7 @@ def extract_text_ocr(
     for credential resolution failures.
     """
     provider = make_provider(config)
+    workers = config.max_concurrency if max_concurrency is None else max_concurrency
 
     page_image_paths = sorted(page_images_dir.glob(PAGE_GLOB))
     if not page_image_paths:
@@ -294,8 +355,9 @@ def extract_text_ocr(
     _clear_page_text(output_dir)
 
     def _process_one_page(path: Path) -> list[dict[str, Any]] | None:
-        """Read one page image, derive its pixel dims, call the provider,
-        write its page JSON."""
+        """Read one page image, derive its pixel dims, call the provider, and
+        write its page JSON — deskewing the image and word boxes first when the
+        provider reports a significant page skew."""
         page_num = _page_num_from_image_name(path.name)
         if page_num is None:
             return None
@@ -304,8 +366,18 @@ def extract_text_ocr(
             dims = _image_dimensions(image_bytes)
         except ValueError as exc:
             raise OcrFailed(f"page {page_num}: invalid PNG at {path}: {exc}") from exc
-        words = provider.analyze_image(image_bytes, dims, page_num)
-        _write_page_json(output_dir, page_num, file_id, dims[0], dims[1], words)
+        page = _as_page_result(provider.analyze_image(image_bytes, dims, page_num))
+        words = page.words
+        rotation: float | None = None
+        if should_rotate(page.angle):
+            # Correct the skew: rotate the page image and its word boxes by the
+            # same transform, then rewrite the canonical page image in place so
+            # grounding / generation / export all see the deskewed page. The
+            # recorded dims below come from the rotated image.
+            image_bytes, dims, words = deskew_page(image_bytes, dims, words, page.angle)
+            path.write_bytes(image_bytes)
+            rotation = page.angle
+        _write_page_json(output_dir, page_num, file_id, dims[0], dims[1], words, rotation=rotation)
         return words
 
     pages_written = 0
@@ -313,7 +385,7 @@ def extract_text_ocr(
     total_words = 0
     # Folded on this thread, in page order; the counters are order-independent
     # sums and each worker has already written its own page JSON.
-    for words in map_concurrent(_process_one_page, page_image_paths, max_workers=max_concurrency):
+    for words in map_concurrent(_process_one_page, page_image_paths, max_workers=workers):
         if words is None:
             continue
         pages_written += 1
@@ -384,6 +456,8 @@ def _write_page_json(
     width_px: int,
     height_px: int,
     words: list[dict[str, Any]],
+    *,
+    rotation: float | None = None,
 ) -> None:
     payload: dict[str, Any] = {
         "file_id": file_id,
@@ -392,6 +466,13 @@ def _write_page_json(
         "height": height_px,
         "words": words,
     }
+    # Present only when the page was deskewed: the clockwise skew (degrees) that
+    # was corrected. ``width``/``height`` above are the post-rotation dims and the
+    # word boxes are already in the rotated frame. It's a provenance note and the
+    # signal the hybrid merge uses to rotate the digital boxes into this same
+    # deskewed frame before merging (see ``_merge_into``).
+    if rotation is not None:
+        payload["rotation"] = round(float(rotation), 4)
     out_path = output_dir / PAGE_TEXT_FILENAME.format(page=page_num)
     out_path.write_text(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n",

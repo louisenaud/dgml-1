@@ -194,7 +194,34 @@ def load_store_configs(
         raise StorageConfigInvalid(f"no [storage.{service}] configured")
     if table is not None:
         _reject_mixed_form(table, service)
-    return _role_config(table, "blobs", root), _role_config(table, "docs", root)
+    blobs, docs = _role_config(table, "blobs", root), _role_config(table, "docs", root)
+    _reject_borrowed_workspace_path(blobs, docs, service, workspace)
+    return blobs, docs
+
+
+def _reject_borrowed_workspace_path(
+    blob_cfg: StorageConfig, doc_cfg: StorageConfig, service: str, workspace: Workspace
+) -> None:
+    """Refuse a ``workspace_path`` that came from a *shared* config layer.
+
+    Only reached from :func:`load_store_configs` — when the workspace does not define the
+    service itself and resolution fell back to the merged config — so the option was
+    written in the user-level ``config.toml``, in a template meant to serve many
+    workspaces. One in a workspace's own config never arrives here.
+
+    Honouring it would point every workspace on that template at the same directory, and
+    it would reach only ``LocalStore``: the store of workspaces reads each workspace's own
+    config, so ``Workspace.root`` and the directory the store writes to would disagree."""
+    if not any("workspace_path" in cfg.options for cfg in (blob_cfg, doc_cfg)):
+        return
+    from .storage import user_config_path
+
+    raise StorageConfigInvalid(
+        f"[storage.{service}] in {user_config_path()} sets 'workspace_path'. That option "
+        f"pins one workspace to one directory, so it cannot live in a config shared by "
+        f"many. Remove it there; to pin this workspace's data where it already is, run "
+        f"'dgml workspace import {workspace.root}'."
+    )
 
 
 def _reject_mixed_form(table: Mapping[str, Any], service: str) -> None:

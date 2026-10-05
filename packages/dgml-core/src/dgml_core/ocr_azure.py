@@ -24,12 +24,22 @@ import os
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from .errors import AuthError, OcrConfigInvalid, OcrFailed
-from .ocr import OcrConfig, OcrProvider, OcrProviderName
+from .errors import AuthError, MissingExtra, OcrConfigInvalid, OcrFailed
+from .ocr import OcrConfig, OcrPageResult, OcrProvider, OcrProviderName
 from .text_extraction import split_word_into_tokens
 
 if TYPE_CHECKING:  # pragma: no cover - import-time-only types
     from azure.core.credentials import AzureKeyCredential, TokenCredential
+
+# Client-side timeouts and retry for the Azure DI HTTP calls. Without these the
+# SDK will block indefinitely on a stalled connection (a hung read never raises),
+# which can freeze a whole batch on a single wedged request. These bound each
+# HTTP call and let azure-core auto-retry transient failures (incl. read
+# timeouts) before we surface an OcrFailed.
+_CONNECT_TIMEOUT_S = 30.0
+_READ_TIMEOUT_S = 120.0
+_RETRY_TOTAL = 3
+_RETRY_BACKOFF_S = 1.0
 
 
 class AzureProvider(OcrProvider):
@@ -61,20 +71,33 @@ class AzureProvider(OcrProvider):
         try:
             from azure.ai.documentintelligence import DocumentIntelligenceClient
         except ImportError as exc:
-            raise OcrFailed(
+            raise MissingExtra(
                 "azure-ai-documentintelligence is required for Azure OCR. "
-                "Install with `pip install dgml[azure]`."
+                "Install with `pip install dgml[azure]`.",
+                extra="azure",
+                distribution="azure-ai-documentintelligence",
             ) from exc
 
         assert config.endpoint is not None  # validated by load_ocr_config
-        self._client = DocumentIntelligenceClient(config.endpoint, _azure_credential(config))
+        # connection_timeout / read_timeout bound each HTTP request (the read
+        # timeout is what turns a wedged connection into a prompt error instead
+        # of an indefinite hang); retry_* let azure-core auto-retry transient
+        # failures. All are standard azure-core client kwargs.
+        self._client = DocumentIntelligenceClient(
+            config.endpoint,
+            _azure_credential(config),
+            connection_timeout=_CONNECT_TIMEOUT_S,
+            read_timeout=_READ_TIMEOUT_S,
+            retry_total=_RETRY_TOTAL,
+            retry_backoff_factor=_RETRY_BACKOFF_S,
+        )
 
     def analyze_image(
         self,
         image_bytes: bytes,
         image_dims_px: tuple[int, int],
         page_num: int,
-    ) -> list[dict[str, Any]]:
+    ) -> OcrPageResult:
         try:
             poller = self._client.begin_analyze_document("prebuilt-read", body=BytesIO(image_bytes))
             result = poller.result()
@@ -86,8 +109,13 @@ class AzureProvider(OcrProvider):
 
         pages = getattr(result, "pages", None) or []
         if not pages:
-            return []
+            return OcrPageResult(words=[], angle=0.0)
         page = pages[0]
+        # page.angle is the clockwise orientation of the content in degrees,
+        # in (-180, 180]; may be absent/None. The shared OCR loop deskews the
+        # page image + boxes when this is significant.
+        angle = getattr(page, "angle", None)
+        page_angle = float(angle) if isinstance(angle, (int, float)) else 0.0
         # We always send image input, so Azure should always report
         # unit='pixel' with polygon coordinates already in the input
         # image's pixel space. Anything else is a service contract
@@ -114,7 +142,7 @@ class AzureProvider(OcrProvider):
             # LTChar level using true coordinates.
             for tk_text, tk_box in split_word_into_tokens(text, box):
                 words.append({"t": tk_text, "l": list(tk_box)})
-        return words
+        return OcrPageResult(words=words, angle=page_angle)
 
 
 def _azure_credential(config: OcrConfig) -> AzureKeyCredential | TokenCredential:
@@ -136,18 +164,22 @@ def _azure_credential(config: OcrConfig) -> AzureKeyCredential | TokenCredential
         try:
             from azure.core.credentials import AzureKeyCredential
         except ImportError as exc:
-            raise OcrFailed(
+            raise MissingExtra(
                 "azure-ai-documentintelligence is required for Azure OCR. "
-                "Install with `pip install dgml[azure]`."
+                "Install with `pip install dgml[azure]`.",
+                extra="azure",
+                distribution="azure-ai-documentintelligence",
             ) from exc
         return AzureKeyCredential(key)
 
     try:
         from azure.identity import DefaultAzureCredential
     except ImportError as exc:
-        raise OcrFailed(
+        raise MissingExtra(
             "azure-identity is required for token-based Azure OCR. "
-            "Install with `pip install dgml[azure]`."
+            "Install with `pip install dgml[azure]`.",
+            extra="azure",
+            distribution="azure-identity",
         ) from exc
     return DefaultAzureCredential()
 

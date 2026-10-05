@@ -19,8 +19,10 @@ element can span pages.
 
 The root is determined in this order:
 
-1. `--workspace <path-or-id>` CLI flag (or `Workspace.resolve(<path-or-id>)` in
-   code). The argument is a filesystem path **or** a workspace id. Since an id needs no
+1. `--workspace <path-or-id>` CLI flag (or, in code, `Workspace.open(<path-or-id>)` —
+   which resolves *and* migrates, seal-checks and requires an initialized workspace;
+   `Workspace.resolve` does only the first step and is for the commands that run before a
+   workspace exists). The argument is a filesystem path **or** a workspace id. Since an id needs no
    distinguishing prefix (`my-workspace` is as valid as a generated `ws_qf7imkc7f6oqzfwt`)
    it is also a legal directory name, so the two are told apart in four steps:
 
@@ -46,7 +48,7 @@ The root is determined in this order:
    [the store of workspaces](#the-store-of-workspaces) instead. Item 3 is what keeps a
    workspace made by an older dgml — or by `create <path>` — opening with no arguments.
 
-`dgml workspace create --organization <org>` (or `Workspace.init()` in code)
+`dgml workspace create --organization <org>` (or `create_workspace(organization=…)` in code)
 creates the directory layout for a fresh workspace and records its identity in
 `workspace.json`. Where it creates it depends on whether you name a place: a path (or
 `--workspace` / `$DGML_HOME` pointing at one) makes a workspace in that directory,
@@ -138,6 +140,33 @@ many workspaces (e.g. the clustering sweep's per-cell workspaces in
 [evaluation/clustering/](../evaluation/clustering/), which sets it automatically;
 `--no-page-cache` opts out). Entries are plain `<hash>/page_*.png` directories
 and are safe to delete at any time.
+
+## Staging scratch space (`$TMPDIR`)
+
+A workspace whose blobs live on a **remote** backend has no local directory to work in,
+but parts of the pipeline need real paths — ghostscript renders page images to a
+directory, pdfminer reads a PDF path. Those are staged through Python's `tempfile`,
+which picks a directory in this order:
+
+1. **`$TMPDIR`** — the one to set
+2. `$TEMP`, then `$TMP`
+3. `/tmp`, `/var/tmp`, `/usr/tmp` (on Windows: `%LOCALAPPDATA%\Temp`, `%SYSTEMROOT%\Temp`, …)
+4. the current working directory
+
+**Point `TMPDIR` at real disk on a container platform.** `$TMPDIR` — or `/tmp` when it
+is unset — is RAM-backed on Cloud Run, on `emptyDir: {medium: Memory}` volumes, and by
+default on Fedora/RHEL/Arch, so staging there counts against the memory limit. A whole
+batch is staged at once: roughly 1.5 GB of page images for a 500-page document.
+
+```bash
+TMPDIR=/mnt/scratch dgml file add big.pdf
+```
+
+Set it **before the process starts** — Python memoizes `tempfile.gettempdir()` on first
+call, so exporting it mid-run has no effect.
+
+Workspaces on the bundled local-disk store are unaffected: `LocalStore` stages in the
+workspace's own `.cache/staging/`.
 
 ## `workspace.json`
 

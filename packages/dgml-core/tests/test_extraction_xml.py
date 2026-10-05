@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import pytest
-from dgml_core.extraction_schema import json_schema_to_rnc, parse_rnc
+from dgml_core.extraction_schema import Tag, Vocabulary, json_schema_to_rnc, parse_rnc
 from dgml_core.extraction_xml import (
     carry_extraction_over,
     count_dropped_refs,
@@ -209,6 +209,59 @@ def test_integer_strips_thousands_separator() -> None:
     xml = standalone_extraction_doc(values, vocab=vocab)
     assert '<docset:TotalCredits xsi:type="integer" dg:value="8500"' in xml
     assert dgml_xml_to_values(xml, vocab=vocab)["TotalCredits"]["value"] == "8500"
+
+
+def _string_id_vocab() -> Vocabulary:
+    """A vocab with one explicitly string-typed id field and one untyped field."""
+    return Vocabulary(
+        namespace_uri="http://acme.example/ns#",
+        roots=[
+            Tag(name="PremiseId", kind="field", value_type="string"),
+            Tag(name="Note", kind="field"),  # untyped → heuristic detection
+        ],
+    )
+
+
+def test_string_type_emits_verbatim_id_without_coercion() -> None:
+    """An explicitly string-typed field emits its text verbatim — no xsi:type, no
+    dg:value — so an all-digit id keeps its leading zero instead of being coerced
+    to an integer. An untyped sibling with the same text still detects as integer."""
+    vocab = _string_id_vocab()
+    values = {
+        "PremiseId": {
+            "text": "0819510000",
+            "locations": [{"page_number": 1, "bounding_box": [280, 898, 488, 935]}],
+        },
+        "Note": {"text": "0819510000", "locations": []},
+    }
+    xml = standalone_extraction_doc(values, vocab=vocab)
+    assert '<docset:PremiseId dg:origin="1 280 898 488 935">0819510000</docset:PremiseId>' in xml
+    assert "xsi:type" not in xml.split("<docset:Note")[0]  # PremiseId carries no type
+    # Contrast: the untyped sibling still heuristically types as integer — the
+    # semantic the string type exists to avoid on ids.
+    assert '<docset:Note xsi:type="integer" dg:value="0819510000"' in xml
+    # Round-trips as plain text (no value projection for the string id).
+    back = dgml_xml_to_values(xml, vocab=vocab)
+    assert back["PremiseId"]["text"] == "0819510000"
+    assert "value" not in back["PremiseId"]
+
+
+def test_string_type_computed_keeps_value_without_type() -> None:
+    """A computed string-typed field keeps its mandatory dg:value (verbatim) but
+    still carries no xsi:type."""
+    vocab = _string_id_vocab()
+    values = {
+        "PremiseId": {
+            "text": "0819510000",
+            "value": "0819510000",
+            "computed": True,
+            "derived_from": [],
+        },
+    }
+    xml = standalone_extraction_doc(values, vocab=vocab)
+    assert 'dg:origin="computed"' in xml
+    assert 'dg:value="0819510000"' in xml
+    assert "xsi:type" not in xml
 
 
 def test_choice_range_branch() -> None:

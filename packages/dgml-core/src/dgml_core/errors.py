@@ -10,7 +10,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Custom exceptions and persistent error records."""
+"""Custom exceptions and persistent error records.
+
+Every class carries a stable ``code``, and every code has a row in
+``docs/cli-reference.md``; ``tests/test_error_codes.py`` pins both directions,
+so add the row in the same change as the class.
+
+Two kinds of code here are never raised — worth knowing before deleting one as
+dead:
+
+- *Soft-failure carriers* (:class:`GenerationFailed`,
+  :class:`LabelModelUnreachable`) name a per-item failure that lands in a
+  results payload. Callers read ``TheClass.code``.
+- *CLI-layer codes* have no class at all. ``INTERNAL_ERROR`` is permanently one
+  (it exists for exceptions that are *not* a :class:`DgmlError`).
+  ``EMPTY_DOCSET``, ``NO_FILES`` and ``VALUES_NOT_FOUND`` are domain
+  preconditions that become classes when their operations move out of
+  ``cli.py``.
+"""
 
 from __future__ import annotations
 
@@ -30,9 +47,29 @@ class DgmlError(Exception):
 
     code: str = "DGML_ERROR"
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        # ``Exception.__reduce__`` rebuilds via ``cls(*args)`` — the message
+        # alone — so a subclass with required keyword arguments would come back
+        # from a pickle or ``copy.deepcopy`` as a ``TypeError``. Rebuild without
+        # ``__init__`` and restore the instance state instead; nothing per class.
+        return (_blank, (type(self),), {"args": self.args, **vars(self)})
+
+
+def _blank(cls: type[DgmlError]) -> DgmlError:
+    return cls.__new__(cls)
+
 
 class WorkspaceNotInitialized(DgmlError):
+    """A workspace was addressed but has no config, so it cannot be opened.
+
+    ``workspace`` is the one that could not be opened — required, so a handler
+    never has to re-resolve it from whatever was addressed."""
+
     code = "WORKSPACE_NOT_INITIALIZED"
+
+    def __init__(self, message: str, *, workspace: Workspace) -> None:
+        super().__init__(message)
+        self.workspace = workspace
 
 
 class NotFoundError(DgmlError):
@@ -64,6 +101,25 @@ class InvalidPDF(DgmlError):
     code = "INVALID_PDF"
 
 
+class MissingExtra(DgmlError):
+    """An optional dependency group (a ``dgml[<extra>]``) is not installed.
+
+    ``extra`` is the name in ``pip install dgml[<extra>]``; ``distribution`` is
+    the package whose import failed, where known. Fields rather than prose so a
+    caller can offer the install without re-parsing the message.
+
+    Not :class:`EngineNotAvailable`, which is the configured PDF engine failing
+    to run — ghostscript, its default, is a system binary and no extra at all.
+    """
+
+    code = "MISSING_EXTRA"
+
+    def __init__(self, message: str, *, extra: str, distribution: str | None = None) -> None:
+        super().__init__(message)
+        self.extra = extra
+        self.distribution = distribution
+
+
 class EngineNotAvailable(DgmlError):
     """The configured PDF engine cannot run — its binary or Python package is
     not installed. Raised for either capability (rendering or slicing), since
@@ -87,10 +143,6 @@ class PdfSliceFailed(DgmlError):
 
 class TextExtractionFailed(DgmlError):
     code = "TEXT_EXTRACTION_FAILED"
-
-
-class NotImplementedMode(DgmlError):
-    code = "NOT_IMPLEMENTED"
 
 
 class InvalidArgument(DgmlError):
@@ -218,6 +270,10 @@ class ConversionFailed(DgmlError):
     code = "CONVERSION_FAILED"
 
 
+# The ``operation`` a converter's failure is recorded under at ``file add``.
+CONVERT_TO_PDF_OPERATION = "convert_to_pdf"
+
+
 class AuthError(DgmlError):
     code = "AUTH_ERROR"
 
@@ -318,6 +374,10 @@ class SchemaGenerationFailed(DgmlError):
 
 
 class GenerationFailed(DgmlError):
+    # Never raised — a file that produced no output is a per-item `failed` entry
+    # in `docset generate`'s results, not an abort of the whole batch. Exists so
+    # that payload draws its `code` from this registry, exactly as
+    # `LabelModelUnreachable` below does for `label_error`.
     code = "GENERATION_FAILED"
 
 

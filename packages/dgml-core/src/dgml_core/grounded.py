@@ -56,13 +56,16 @@ from . import layout
 from .config import load_merged_config
 from .docsets import DocSetStore
 from .errors import (
+    CONVERT_TO_PDF_OPERATION,
     AuthError,
+    ConversionFailed,
     FileNotFound,
     GroundedConfigInvalid,
     GroundedConfigMissing,
     SchemaGenerationFailed,
     SchemaInvalid,
     ValuesExtractionFailed,
+    load_recorded_errors,
     now_iso,
 )
 from .extraction_schema import (
@@ -329,10 +332,35 @@ def get_page_words(
 
 
 def _pdf_bytes(workspace: Workspace, file_id: str) -> bytes:
-    """Return the bytes of the single ``*.pdf`` stored for ``file_id``."""
+    """Return the bytes of the single ``*.pdf`` stored for ``file_id``.
+
+    A convertible source whose conversion failed at ``file add`` has a
+    record but no PDF, and the converter's error is among the file's
+    recorded errors: such a file raises :class:`ConversionFailed` repeating
+    that error. A file with no PDF and no recorded conversion error raises
+    :class:`FileNotFound` as before.
+    """
     keys = workspace.blobs.list_blobs(layout.file_prefix(file_id))
     pdfs = [k for k in keys if k.endswith(".pdf")]
     if not pdfs:
+        try:
+            failed = [
+                err.message.strip()
+                for err in load_recorded_errors(workspace, file_id)
+                if err.operation == CONVERT_TO_PDF_OPERATION
+                and isinstance(err.message, str)
+                and err.message.strip()
+            ]
+        except (TypeError, KeyError, ValueError, AttributeError):
+            # The lookup is a diagnostic: a malformed errors document (a
+            # wrong shape, a missing field) must not turn the missing PDF
+            # into an internal error; a record without a usable message is
+            # skipped the same way.
+            failed = []
+        if failed:
+            raise ConversionFailed(
+                f"file '{file_id}' has no source PDF: converting it failed: {failed[-1]}"
+            )
         raise FileNotFound(f"file '{file_id}' has no source PDF")
     return workspace.blobs.get_blob(pdfs[0])
 
@@ -632,6 +660,7 @@ def extract_values(
     phase2_duration = 0.0
     phase3_duration = 0.0
     phase3_page_calls = 0
+    phase3_pages_out_of_range = 0
     phase2_matched = 0
     phase3_matched = 0
     unmatched_count = 0
@@ -784,12 +813,18 @@ def extract_values(
         # --- Phase 3: per-page LLM for remaining unmatched ----------
         phase3_started = time.monotonic()
         final_values = phase2_result.values
-        if phase2_result.unmatched:
+        unmatched, phase3_pages_out_of_range = _drop_out_of_range_pages(
+            workspace,
+            file_id,
+            phase2_result.unmatched,
+            page_count=FileStore(workspace).get(file_id).page_count,
+        )
+        if unmatched:
             final_values, phase3_matched, phase3_page_calls = _run_phase3(
                 workspace=workspace,
                 file_id=file_id,
                 values=final_values,
-                unmatched=phase2_result.unmatched,
+                unmatched=unmatched,
                 model=config.values_model,
                 api_key=api_key,
                 api_base=api_base,
@@ -803,6 +838,8 @@ def extract_values(
         # <stem>.dgml.xml (spec §13): added as a sibling of an existing document
         # tree (full-extraction), or written as a standalone dg:chunk when no
         # tree exists yet (extraction).
+        # Read again after phase 3, as before: a file deleted meanwhile
+        # raises here rather than getting an orphan XML written for it.
         stem = Path(FileStore(workspace).get(file_id).original_filename).stem
         xml_key = layout.dgml_xml_key(docset_id, file_id, stem)
         existing = (
@@ -878,6 +915,7 @@ def extract_values(
                     phase2_duration=phase2_duration,
                     phase3_duration=phase3_duration,
                     phase3_page_calls=phase3_page_calls,
+                    phase3_pages_out_of_range=phase3_pages_out_of_range,
                     phase2_matched=phase2_matched,
                     phase3_matched=phase3_matched,
                     unmatched=unmatched_count,
@@ -942,6 +980,7 @@ def _write_extraction_stats(
     phase2_duration: float,
     phase3_duration: float,
     phase3_page_calls: int,
+    phase3_pages_out_of_range: int,
     phase2_matched: int,
     phase3_matched: int,
     unmatched: int,
@@ -985,6 +1024,10 @@ def _write_extraction_stats(
             "phase3": {
                 "duration_s": phase3_duration,
                 "page_calls": phase3_page_calls,
+                # pages phase 1 cited that the file does not have (outside
+                # 1..page_count, no page image); their items stay unmatched
+                # and no call is made for them.
+                "pages_out_of_range": phase3_pages_out_of_range,
                 **phase3_totals,
             },
         },
@@ -1025,6 +1068,37 @@ def _write_extraction_stats(
 
 
 _PHASE3_MAX_PARALLEL = 8
+
+
+def _drop_out_of_range_pages(
+    workspace: Workspace,
+    file_id: str,
+    unmatched: list[UnmatchedItem],
+    *,
+    page_count: int | None,
+) -> tuple[list[UnmatchedItem], int]:
+    """Drop the phase-3 items on pages the file does not have, before any call.
+
+    Phase 1 occasionally cites page 2 of a one-page invoice. Such a page has
+    no image to send, and raising over it threw away the whole tree, phase-2
+    matches included (#155). The items simply stay unmatched; the number of
+    pages dropped goes to the stats sidecar. A page is dropped only when the
+    record's ``page_count`` is known and positive, the page is outside
+    ``1..page_count``, and the page has no image: a stale or zero count
+    cannot hide a page that was rendered, and a record without a count keeps
+    the loud failure for a missing page image. Returns
+    ``(items_to_locate, pages_out_of_range)``.
+    """
+    if page_count is None or page_count <= 0:
+        return unmatched, 0
+    outside = {item.page_number for item in unmatched if not 1 <= item.page_number <= page_count}
+    missing = {
+        page
+        for page in outside
+        if not workspace.blobs.blob_exists(layout.file_page_image_key(file_id, page))
+    }
+    kept = [item for item in unmatched if item.page_number not in missing]
+    return kept, len(missing)
 
 
 def _run_phase3(

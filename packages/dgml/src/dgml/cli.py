@@ -28,6 +28,7 @@ import shutil
 import sys
 import tomllib
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
@@ -45,20 +46,18 @@ from dgml_core.docsets import DocSetStore
 from dgml_core.errors import (
     ConflictError,
     DgmlError,
+    GenerationFailed,
     InvalidArgument,
+    MissingExtra,
     NoExistingDocSets,
     StorageBackendMismatch,
     WorkspaceNotInitialized,
-    now_iso,
     short_error_message,
 )
 from dgml_core.files import AddFileResult, ConflictPolicy, FileStore
 from dgml_core.ids import RECORD_ID_SHAPE
 from dgml_core.migrations import (
     MigrationResult,
-    migrate_workspace,
-    migrate_workspace_config,
-    stamp_schema_version,
 )
 from dgml_core.models import DocSet
 from dgml_core.pages import DEFAULT_DPI, load_pdf_config
@@ -78,12 +77,11 @@ from dgml_core.storage import (
 from dgml_core.storage_resolve import (
     DEFAULT_STORAGE_PROVIDER,
     DEFAULT_STORAGE_SERVICE,
-    load_store_configs,
     storage_fingerprint_pair,
-    verify_storage_fingerprint,
 )
 from dgml_core.text_extraction import TextMode
-from dgml_core.workspace_id import ID_SHAPE, generate_unique_workspace_id, is_workspace_id
+from dgml_core.workspace_create import create_workspace
+from dgml_core.workspace_id import ID_SHAPE, is_workspace_id
 from dgml_core.workspaces_resolve import default_workspaces_store
 from dgml_core.workspaces_store import WorkspacesStore
 
@@ -1195,10 +1193,11 @@ def _add_chain_subparsers(
         _chain_config_arg(pv)
 
 
-def _report_migrations(
-    results: list[MigrationResult], ws: Workspace, args: argparse.Namespace
-) -> None:
-    """Announce an applied workspace migration on stderr, under ``--verbose``.
+def _migration_reporter(
+    args: argparse.Namespace,
+) -> Callable[[Workspace, MigrationResult], None] | None:
+    """The ``Workspace.open(on_migration=…)`` callback: announce an applied
+    workspace migration on stderr, under ``--verbose``. ``None`` when quiet.
 
     Verbose-gated on purpose. Migrations are automatic, additive and
     idempotent, so the default-quiet cost is low — whereas stderr carries the
@@ -1208,13 +1207,16 @@ def _report_migrations(
     ``--verbose`` stderr is already non-JSON (that is where the traceback
     goes), so the notice is free there.
 
-    A migration that changed nothing says nothing either way: bumping the
-    version stamp on a workspace that had no work to do is bookkeeping, not an
-    upgrade."""
+    A migration that changed nothing says nothing either way, and never reaches
+    this callback: bumping the version stamp on a workspace that had no work to
+    do is bookkeeping, not an upgrade."""
     if not (getattr(args, "verbose", False) or os.environ.get("DGML_DEBUG")):
-        return
-    for result in (r for r in results if r.changed):
+        return None
+
+    def report(ws: Workspace, result: MigrationResult) -> None:
         sys.stderr.write(f"[dgml] upgraded workspace at {ws.root} — {result.summary()}\n")
+
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1224,40 +1226,26 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         _reject_retired_config_flag(args)
-        ws = Workspace.resolve(args.workspace)
-        # `init` manages only the user-level config; `workspace create`
-        # is what actually builds the workspace — so both run before the
-        # workspace exists.
-        if args.command not in ("init", "workspace"):
-            # Move a pre-upgrade workspace's storage binding out of this machine's
-            # registry and into its own config.toml. Store-free and content-guarded,
-            # so it must run FIRST: everything below reads the store, and until this
-            # has run the store a legacy workspace resolves is the wrong one.
-            migrate_workspace_config(ws)
-            # Then check that binding against the workspace's own seal, still before
-            # any store is built — a drifted [storage] raises here rather than
-            # silently opening an empty backend. `workspace reseal` (exempt above,
-            # under the `workspace` group) is how an intended change is accepted.
-            verify_storage_fingerprint(ws)
-            # One check, not two: `is_initialized()` *is* "has a config". The config
-            # names the backend and cannot be reconstructed from anything else, so an
-            # absent one is indistinguishable from "never a workspace" — and both want
-            # the same answer from the caller. The message covers both readings.
-            if not ws.is_initialized():
+        # `init` manages only the user-level config; `workspace create` is what
+        # actually builds the workspace — so both run before the workspace exists
+        # and get `resolve` (which only answers "which workspace") rather than
+        # `open` (which also migrates it, and requires it to be initialized).
+        if args.command in ("init", "workspace"):
+            ws = Workspace.resolve(args.workspace)
+        else:
+            try:
+                ws = Workspace.open(args.workspace, on_migration=_migration_reporter(args))
+            except WorkspaceNotInitialized as exc:
+                # Re-raised with remedies the library cannot offer: every one of them
+                # is a `dgml` command, and which of them applies depends on how this
+                # invocation addressed the workspace (see `_uninitialized_message`).
                 raise WorkspaceNotInitialized(
-                    _uninitialized_message(ws, from_default=_root_is_the_cwd_default(args))
-                )
+                    _uninitialized_message(
+                        exc.workspace, from_default=_root_is_the_cwd_default(args)
+                    ),
+                    workspace=exc.workspace,
+                ) from exc
             _warn_if_config_declares_workspaces(ws)
-            # Upgrade an older workspace in place before anything reads it. This
-            # is the one point every command passes through, so there is no
-            # separate migrate step to remember. No-op (one document read) when
-            # the workspace is already current.
-            #
-            # Nothing is indexed here any more. The old per-machine index had to be
-            # written on every open to stay current; a workspace's config now lives in
-            # the store of workspaces that lists it, so being listed is not a separate
-            # fact that can fall out of date.
-            _report_migrations(migrate_workspace(ws), ws, args)
         return _dispatch(args, ws, fmt)
     except DgmlError as exc:
         return _emit_error(exc.code, str(exc), fmt)
@@ -1550,29 +1538,6 @@ def _read_seed_config(args: argparse.Namespace) -> str | None:
             f"({user_config_path()}), so it would have no effect here. Remove it."
         )
     return text
-
-
-def _write_workspace_config(ws: Workspace, service: str, seeded: bool) -> None:
-    """Give a new workspace the ``[storage.<service>]`` table it will resolve from.
-
-    When the workspace was seeded from a config the user authored (``--from-config``),
-    its ``[storage]`` is left exactly as written. Otherwise the named service is
-    materialized out of the user-level config into the workspace's own config, so the
-    workspace is self-describing from the moment it exists.
-
-    Never clobbers a ``[storage.<service>]`` the config already defines — ``workspace
-    create`` is documented as safe to re-run.
-    """
-    from dgml_core import workspace_config as wsconfig
-
-    if seeded or wsconfig.read_storage_table(ws, service) is not None:
-        return
-    blob_cfg, doc_cfg = load_store_configs(ws, service)
-    table: dict[str, Any] = {
-        "blobs": {"provider": blob_cfg.provider, **dict(blob_cfg.options)},
-        "docs": {"provider": doc_cfg.provider, **dict(doc_cfg.options)},
-    }
-    wsconfig.write_storage_table(ws, service, table)
 
 
 def _import_one(
@@ -1893,146 +1858,48 @@ def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
 
         seed = _read_seed_config(args)
 
-        if listed and ws.workspaces_id is None:
-            # The id has to come first, because for a store-listed workspace the root is
-            # derived from it — the reverse of the detached order.
-            store = default_workspaces_store()
-            new_id = requested_id or generate_unique_workspace_id(store)
-            store.write_config(new_id, seed or "")
-            ws = Workspace(root=store.workspace_root(new_id), workspaces_id=new_id)
-        elif seed is not None and not ws.config_present:
-            # Detached: the seed becomes the workspace's own config.toml, then is
-            # forgotten. It is a template, not an adopted file — later edits to the
-            # source have no effect on this workspace.
-            ws.root.mkdir(parents=True, exist_ok=True)
-            wsconfig.write_config_text(ws, seed)
+        result = create_workspace(
+            None if (listed and ws.workspaces_id is None) else ws,
+            workspace_id=requested_id,
+            organization=args.organization,
+            name=args.name,
+            storage_service=args.storage,
+            seed_toml=seed,
+        )
+        ws = result.workspace
+        workspace_id = result.identity.workspace_id or ""
+        name = result.identity.name or ""
+        organization = result.identity.organization or ""
+        service = result.identity.storage_service or DEFAULT_STORAGE_SERVICE
 
-        # Identity already recorded in the config wins over any local accident. Read it
-        # once: `create` is idempotent, so on a re-run (or on a second machine sharing a
-        # store of workspaces) these are the values that must survive.
-        recorded = wsconfig.read_identity(ws)
-
-        # Prefer an explicit --name, then the name the config already records, and only
-        # then the directory name. Without the middle term, re-running create against a
-        # shared config renames the workspace after whatever the local directory happens
-        # to be called — overwriting the display name in the remote store too.
-        name = args.name or recorded.name or ws.root.name
-
-        # --organization is required for a *new* workspace and optional once the config
-        # records one, so adopting an existing workspace does not make you retype the
-        # value that defines its namespace URIs — retyping it is exactly how a typo
-        # would re-organize the whole org's workspace.
-        organization = args.organization or recorded.organization
-        if organization is None:
-            raise InvalidArgument(
-                "--organization is required to create a workspace. It is embedded in "
-                "this workspace's docset namespace URIs "
-                "(http://dgml.io/<organization>/<DocSetSlug>), so pick a stable "
-                "identifier for your org. It becomes optional once the workspace's "
-                "config.toml records one."
-            )
-        if (
-            args.organization is not None
-            and recorded.organization is not None
-            and args.organization != recorded.organization
-        ):
+        if result.organization_changed_from is not None:
             # Loud, and not behind --verbose: this rewrites the organization for every
             # consumer of the workspace, and only affects *newly* generated XML, so the
             # corpus ends up split across two namespaces with nothing to flag it later.
             sys.stderr.write(
                 f"Warning: --organization {args.organization!r} differs from the "
-                f"{recorded.organization!r} recorded in {ws.config_path}.\n\n"
+                f"{result.organization_changed_from!r} recorded in {ws.config_location}.\n\n"
                 f"The workspace is now organization {args.organization!r}. Docset "
                 f"namespace URIs generated from here on will use it, while XML already "
                 f"generated keeps the old namespace.\n\n"
                 f"If this was a typo, re-run with --organization "
-                f"{recorded.organization!r}.\n"
+                f"{result.organization_changed_from!r}.\n"
             )
-        # Inherit the recorded service, exactly as --organization is inherited above,
-        # and for a sharper reason: without the middle term, re-running `create` on a
-        # workspace bound to `acme` silently rebound it to the local-disk `default` and
-        # re-sealed, so the next `file add` wrote to local disk while the corpus sat in
-        # S3 — a silent change of where a user's data goes, on a command documented as
-        # safe to re-run.
-        service = args.storage or recorded.storage_service or DEFAULT_STORAGE_SERVICE
-        if (
-            args.storage is not None
-            and recorded.storage_service is not None
-            and args.storage != recorded.storage_service
-        ):
+        if result.storage_service_changed_from is not None:
             # Loud, and not behind --verbose: this rebinds where the workspace's data
             # lives. Artifacts already written stay on the old backend, so the corpus
             # ends up split across two with nothing to flag it later.
             sys.stderr.write(
                 f"Warning: --storage {args.storage!r} differs from the "
-                f"{recorded.storage_service!r} recorded in {ws.config_location}.\n\n"
+                f"{result.storage_service_changed_from!r} recorded in "
+                f"{ws.config_location}.\n\n"
                 f"This workspace's data now resolves through "
                 f"[storage.{args.storage}]. Anything already written stays on "
-                f"[storage.{recorded.storage_service}] — dgml does not move data.\n\n"
+                f"[storage.{result.storage_service_changed_from}] — dgml does not move "
+                f"data.\n\n"
                 f"If this was not intended, re-run with --storage "
-                f"{recorded.storage_service!r}.\n"
+                f"{result.storage_service_changed_from!r}.\n"
             )
-        # Validate the named service before anything is created, so a bad --storage
-        # fails without leaving a half-built workspace behind. This is also the point
-        # `register_workspace` used to occupy.
-        load_store_configs(ws, service)
-        if seed is not None:
-            # A seed exists to name a backend. If it declares services but not the one
-            # selected, binding would fall through to the bundled local store — silently
-            # building the workspace somewhere the user did not ask for, which is only
-            # discovered once their data appears to be missing.
-            declared = wsconfig.declared_services(ws)
-            if wsconfig.read_storage_table(ws, service) is None and declared:
-                raise InvalidArgument(
-                    f"{ws.config_location} declares no [storage.{service}]. It does declare "
-                    f"{', '.join(f'[storage.{d}]' for d in declared)} — select one with "
-                    f"--storage <name>, or the workspace would be created on the bundled "
-                    f"local-disk store instead of the backend this config names."
-                )
-
-        # Write the whole binding — the [storage.<service>] table *and* the
-        # `storage_service` pointer — before anything resolves a store. Resolution
-        # reads that pointer to decide which table to use, so computing the seal (or
-        # touching ws.blobs/ws.docs) any earlier resolves against a config that does
-        # not yet name the service: the workspace would be built on the bundled local
-        # store and sealed to it, then fail STORAGE_BACKEND_MISMATCH on the very next
-        # command once the pointer became readable.
-        ws.root.mkdir(parents=True, exist_ok=True)
-        _write_workspace_config(ws, service, seed is not None)
-        # Reuse the id the config already carries; generate only for a genuinely new
-        # workspace. Minting unconditionally broke the documented "idempotent and safe
-        # to re-run" promise in two ways: re-running on the same machine forked the id
-        # and left two rows for one workspace, and running it on a second machine
-        # against a shared config changed the org's workspace identity — including the
-        # `workspace` record in the remote doc store.
-        workspace_id = (
-            ws.workspaces_id
-            or recorded.workspace_id
-            or requested_id
-            or generate_unique_workspace_id()
-        )
-        wsconfig.write_identity(
-            ws,
-            workspace_id=workspace_id,
-            name=name,
-            organization=organization,
-            storage_service=service,
-            created_at=recorded.created_at or now_iso(),
-        )
-
-        # Re-open now that the config is complete: `store_configs` is a
-        # cached_property, so a fresh object is what guarantees the seal and the
-        # stores below come from the finished binding rather than a memoized guess.
-        ws = Workspace(root=ws.root, workspaces_id=ws.workspaces_id)
-        wsconfig.write_identity(ws, storage_fingerprint=storage_fingerprint_pair(*ws.store_configs))
-
-        # Now build the workspace through the selected backend. Nothing is
-        # scaffolded first: stores create their own containers on write, so the
-        # workspace exists by virtue of its config and this first document.
-        ws.write_meta(name=name, organization=organization, workspace_id=workspace_id)
-        # Stamp the current layout revision so a brand-new workspace is never
-        # mistaken for an old one and re-scanned by the migration on first use.
-        stamp_schema_version(ws)
 
         upath = user_config_path()
         config_present = upath.exists()
@@ -2051,7 +1918,7 @@ def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
             "workspace_config_path": _workspace_config_file(ws),
             "config_location": ws.config_location,
             "listed": ws.workspaces_id is not None,
-            "storage_fingerprint": wsconfig.read_identity(ws).storage_fingerprint,
+            "storage_fingerprint": result.identity.storage_fingerprint,
             "config_path": str(upath),
             "config_present": config_present,
         }
@@ -2128,7 +1995,8 @@ def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
             raise WorkspaceNotInitialized(
                 _uninitialized_message(
                     ws, from_default=_root_is_the_cwd_default(args, path=args.path)
-                )
+                ),
+                workspace=ws,
             )
         previous = wsconfig.read_identity(ws).storage_fingerprint
         blob_cfg, doc_cfg = ws.store_configs
@@ -2221,12 +2089,11 @@ def _dispatch(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     if cmd == "cluster":
         try:
             from dgml_core.clustering import clustering
-        except ImportError:
-            return _emit_error(
-                "MISSING_EXTRA",
+        except ImportError as exc:
+            raise MissingExtra(
                 "The 'clustering' extra is not installed. Run: pip install dgml[clustering]",
-                fmt,
-            )
+                extra="clustering",
+            ) from exc
         # `clustering` owns the `skipped` key and the skip-existing no-op
         # short-circuit (which avoids re-scanning the workspace). `config`
         # is passed through raw — it may be a preset name or a path.
@@ -2345,10 +2212,10 @@ def _chain_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     # staking/dgml_chain (broken transitive dep, code bug) must surface as
     # INTERNAL_ERROR rather than be masked as "extra not installed".
     if importlib.util.find_spec("dgml_chain") is None:
-        return _emit_error(
-            "MISSING_EXTRA",
+        raise MissingExtra(
             "The 'chain' extra is not installed. Run: pip install dgml[chain]",
-            fmt,
+            extra="chain",
+            distribution="dgml-chain",
         )
     from dgml_core import staking
 
@@ -3405,7 +3272,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                         fid,
                         name,
                         error={
-                            "code": "GENERATION_FAILED",
+                            "code": GenerationFailed.code,
                             "message": (
                                 f"duplicate filename '{name}' within the docset; the "
                                 "generation pipeline keys documents by filename, so give "
@@ -3891,7 +3758,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                             "failed",
                             fid,
                             name,
-                            error={"code": "GENERATION_FAILED", "message": message},
+                            error={"code": GenerationFailed.code, "message": message},
                         )
                     )
             if cov_report_key is not None and cov_results:

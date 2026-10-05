@@ -18,6 +18,14 @@ consumers) doesn't care which mode produced the text.
 
 Merge rules (per page, applied to word bounding boxes):
 
+- **Scan guard**: if the page's content is one full-page raster image
+  (see :data:`RASTER_PAGE_COVERAGE`), the page is a *picture* of a
+  document. Any digital text on it was baked in by whoever scanned it —
+  a previous OCR pass, not the document's own character codes — so the
+  premise the mixed-region rule rests on ("digital comes straight from
+  the PDF font") does not hold, and neither does its geometry: a baked
+  layer sits where that scanner *thought* the ink was. We log a "scan
+  guard" note and use OCR for the entire page.
 - **CID guard**: if digital text has more than
   :data:`MAX_CID_WORDS_PER_PAGE` words containing ``"(cid:"`` — i.e.
   pdfminer couldn't resolve glyphs to Unicode — we treat the whole page's
@@ -89,6 +97,7 @@ from .ocr import OcrConfig, _write_page_json, extract_text_ocr
 from .pages import DEFAULT_DPI
 from .prompts import PromptKey
 from .prompts import get as prompt
+from .rotation import rotate_word_boxes
 from .storage import Workspace
 from .text_extraction import (
     PAGE_TEXT_GLOB,
@@ -114,6 +123,12 @@ LEVENSHTEIN_THRESHOLD = 2
 # glyph IDs to Unicode — we treat the page's digital output as unusable
 # and fall back to OCR for that page.
 MAX_CID_WORDS_PER_PAGE = 10
+# A page whose largest placed image covers at least this fraction of the page
+# area is a scan: a picture of a document rather than a document. Scanned
+# pages run 0.8-0.99 here (the margin the scanner trimmed is the difference);
+# a born-digital page's own artwork - a logo, an icon, a masthead - is orders
+# of magnitude below it, in the low percents.
+RASTER_PAGE_COVERAGE = 0.8
 # Regions needing an LLM decision go out in batches of this many per request.
 # One call for the whole page can overrun the model's output-token limit (or a
 # local model's num_ctx) on dense pages — the reply is truncated mid-JSON and
@@ -190,6 +205,13 @@ def extract_text_hybrid(
                     file=sys.stderr,
                 )
 
+        # Which pages are scans decides whether their digital text may be
+        # trusted at all, so probe before merging. Only worth the pass when
+        # there IS digital text to guard.
+        raster_pages: set[int] = set()
+        if not digital_failed:
+            raster_pages = _raster_page_numbers(pdf_path)
+
         extract_text_ocr(
             pdf_path,
             ocr_dir,
@@ -203,6 +225,7 @@ def extract_text_hybrid(
             ocr_dir,
             output_dir,
             file_id=file_id,
+            raster_pages=raster_pages,
             text_extraction_config=text_extraction_config,
             workspace=workspace,
             verbose=verbose,
@@ -216,6 +239,7 @@ def _merge_into(
     output_dir: Path,
     *,
     file_id: str,
+    raster_pages: set[int] | None = None,
     text_extraction_config: TextExtractionConfig | None = None,
     workspace: Workspace | None = None,
     verbose: bool = False,
@@ -240,9 +264,11 @@ def _merge_into(
         # Prefer OCR's reported dimensions — the PNG IHDR is the source of
         # truth they were measured against. Digital fills in only when OCR
         # didn't process this page.
+        rotation: float | None = None
         if o_payload is not None:
             width = int(o_payload["width"])
             height = int(o_payload["height"])
+            rotation = o_payload.get("rotation")
         else:
             assert d_payload is not None  # at least one side processed this page
             width = int(d_payload["width"])
@@ -250,18 +276,32 @@ def _merge_into(
 
         digital_words = list(d_payload["words"]) if d_payload is not None else []
         ocr_words = list(o_payload["words"]) if o_payload is not None else []
+
+        # If OCR deskewed this page, its image + boxes moved to a new (upright)
+        # frame while the digital boxes are still in the original render's frame
+        # (digital and the pre-rotation page image share a frame — that's the
+        # invariant the whole overlap merge relies on). Rotate the digital boxes
+        # by the *same* transform so they line up again, then merge normally.
+        # This keeps high-fidelity digital text on rotated pages (e.g. a 90°
+        # landscape page) instead of discarding it and falling back to OCR.
+        if rotation and d_payload is not None and digital_words:
+            old_dims = (int(d_payload["width"]), int(d_payload["height"]))
+            digital_words = rotate_word_boxes(
+                digital_words, float(rotation), old_dims, (width, height)
+            )
         merged = _merge_words(
             digital_words,
             ocr_words,
             file_id=file_id,
             page_num=page_num,
+            raster_page=page_num in (raster_pages or set()),
             text_extraction_config=text_extraction_config,
             workspace=workspace,
             verbose=verbose,
             debug=debug,
         )
 
-        _write_page_json(output_dir, page_num, file_id, width, height, merged)
+        _write_page_json(output_dir, page_num, file_id, width, height, merged, rotation=rotation)
         pages_written += 1
         if merged:
             pages_with_words += 1
@@ -280,6 +320,7 @@ def _merge_words(
     *,
     file_id: str,
     page_num: int,
+    raster_page: bool = False,
     text_extraction_config: TextExtractionConfig | None = None,
     workspace: Workspace | None = None,
     verbose: bool = False,
@@ -293,6 +334,27 @@ def _merge_words(
     fall-back to the heuristic for the page on any failure. Per-page warnings
     and summary go to stderr only when ``verbose`` is set.
     """
+    # A scan's digital text is a previous OCR pass baked into the PDF, so it
+    # is not the authority the mixed-region rule assumes. Drop it wholesale
+    # rather than let it override our own read of the same ink. A scanned page
+    # with no digital text needs no guard - the merge already yields OCR.
+    if raster_page and digital_words:
+        if verbose:
+            print(
+                f"scan guard: file_id={file_id} page={page_num}: page is a "
+                f"full-page raster image, so its {len(digital_words)} digital "
+                f"words are an OCR layer baked in by the scanner, not the "
+                f"document's own character codes; using OCR for the entire page",
+                file=sys.stderr,
+            )
+            print(
+                f"hybrid: file_id={file_id} page={page_num}: "
+                f"digital_words={len(digital_words)} ocr_words={len(ocr_words)} "
+                f"merged={len(ocr_words)} scan_guard=true",
+                file=sys.stderr,
+            )
+        return list(ocr_words)
+
     cid_count = _count_cid_words(digital_words)
     if cid_count > MAX_CID_WORDS_PER_PAGE:
         if verbose:
@@ -888,6 +950,59 @@ def _log_region_decision(
         f"keeping {kept} tokens",
         file=sys.stderr,
     )
+
+
+def _raster_page_numbers(pdf_path: Path) -> set[int]:
+    """1-based page numbers whose content is a full-page raster image.
+
+    A page that is a *picture* of a document has no character codes of its
+    own. Digital text found on one was put there by whoever scanned it — a
+    previous OCR pass, baked in — and it is wrong in exactly the way OCR is
+    wrong, while sitting at the coordinates that scanner believed the ink
+    occupied. Both premises the mixed-region rule rests on therefore fail,
+    so :func:`_merge_words` drops the whole layer for these pages.
+
+    Detected by placed image area (:data:`RASTER_PAGE_COVERAGE`) rather than
+    by the text: a scanned page carries the same fonts and the same
+    plausible words as a native one, and the picture underneath is the only
+    thing that tells them apart.
+
+    Layout analysis is skipped (``laparams=None``) — only image placement is
+    read, and grouping a scanned page's several thousand baked glyphs into
+    lines would be the whole cost of the pass for nothing. A PDF pdfminer
+    cannot parse yields an empty set, leaving the merge exactly as it was.
+    """
+    try:
+        from pdfminer.high_level import extract_pages
+        from pdfminer.layout import LTFigure, LTImage
+    except ImportError:
+        return set()
+
+    def largest_image_coverage(container: Any, page_area: float) -> float:
+        best = 0.0
+        for item in container:
+            if isinstance(item, LTImage):
+                x0, y0, x1, y1 = item.bbox
+                best = max(best, max(0.0, x1 - x0) * max(0.0, y1 - y0) / page_area)
+            elif isinstance(item, LTFigure):
+                best = max(best, largest_image_coverage(item, page_area))
+        return best
+
+    raster: set[int] = set()
+    try:
+        for page_num, page_layout in enumerate(
+            extract_pages(str(pdf_path), laparams=None), start=1
+        ):
+            page_area = float(page_layout.width) * float(page_layout.height)
+            if page_area <= 0:
+                continue
+            if largest_image_coverage(page_layout, page_area) >= RASTER_PAGE_COVERAGE:
+                raster.add(page_num)
+    except Exception:
+        # Same posture as a failed digital extraction: the merge is still
+        # correct without this, just less careful, so never fail ingest here.
+        return set()
+    return raster
 
 
 def _count_cid_words(words: list[dict[str, Any]]) -> int:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -367,6 +368,75 @@ def test_local_store_rejects_unknown_options(tmp_path: Path) -> None:
         )
 
 
+def test_workspace_path_in_a_shared_layer_is_rejected(tmp_path: Path) -> None:
+    """``workspace_path`` pins *one* workspace's data to one directory, so it cannot
+    live in a user-level ``[storage.<name>]`` template shared by many.
+
+    Honouring it would point every workspace on the template at the same directory, and
+    it would reach only ``LocalStore`` — not the store of workspaces, which reads each
+    workspace's own config — so ``Workspace.root`` and the directory actually written
+    would disagree."""
+    from dgml_core.storage import user_config_path
+
+    from .conftest import dump_toml
+
+    user = user_config_path()
+    user.parent.mkdir(parents=True, exist_ok=True)
+    user.write_text(
+        dump_toml(
+            {
+                "storage": {
+                    "acme": {
+                        "provider": DEFAULT_STORAGE_PROVIDER,
+                        "workspace_path": str(tmp_path / "elsewhere"),
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    ws = Workspace.resolve(tmp_path / "ws")
+    with pytest.raises(StorageConfigInvalid, match="pins one workspace"):
+        load_store_configs(ws, "acme")
+
+
+def test_workspace_path_in_the_workspaces_own_config_is_honoured(tmp_path: Path) -> None:
+    """The counterpart: the same key in the workspace's *own* config is exactly what
+    ``dgml workspace import`` writes, and must keep working — even when the user config
+    also carries a template of the same name that the guard would reject."""
+    from dgml_core.storage import user_config_path
+    from dgml_core.storage_resolve import resolve_store_configs
+
+    from .conftest import dump_toml, write_config
+
+    user = user_config_path()
+    user.parent.mkdir(parents=True, exist_ok=True)
+    user.write_text(
+        dump_toml(
+            {
+                "storage": {
+                    "provider": DEFAULT_STORAGE_PROVIDER,
+                    "workspace_path": str(tmp_path / "shared"),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    elsewhere = tmp_path / "corpus"
+    ws = Workspace.resolve(tmp_path / "ws")
+    write_config(
+        ws,
+        {
+            "storage": {
+                "provider": DEFAULT_STORAGE_PROVIDER,
+                "workspace_path": str(elsewhere),
+            }
+        },
+    )
+    blob_cfg, _ = resolve_store_configs(ws)
+    assert blob_cfg.options["workspace_path"] == str(elsewhere)
+
+
 def test_load_store_configs_defaults_to_local(tmp_path: Path) -> None:
     # No [storage] section → both roles on the bundled local-disk default.
     ws = Workspace.resolve(tmp_path)
@@ -659,6 +729,40 @@ def test_materialize_default_downloads_to_temp_and_cleans_up(tmp_path: Path) -> 
         assert path.read_bytes() == b"%PDF-1.7"
         held = path
     assert not held.exists()  # cleaned up on exit
+
+
+def test_default_bridge_stages_under_the_configured_temp_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every bridge method a third-party store inherits stages in the ordinary
+    ``tempfile`` location, so an operator redirects all of them at once.
+
+    Pins the behaviour the storage docs promise operators: ``TMPDIR`` redirects all
+    four methods, which matters because it is a RAM-backed tmpfs on many container
+    images. Exercised through ``tempfile.tempdir``
+    rather than the environment because Python memoizes ``gettempdir()`` on first call —
+    which is exactly why an operator has to set ``TMPDIR`` before the process starts."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    store = default_bridge_store(tmp_path / "ws")
+    store.put_blob("files/a/report.pdf", b"%PDF-1.7")
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+
+    seen: list[Path] = []
+    with store.materialize("files/a/report.pdf") as path:
+        seen.append(path)
+    with store.staged_write(_PAGES) as staging:
+        seen.append(staging)
+        (staging / "page_1.png").write_bytes(b"png")
+    with store.materialize_dir("files/a") as out:
+        seen.append(out)
+    with store.working_dir("docsets/d1/cache") as work:
+        seen.append(work)
+
+    assert seen, "no bridge method yielded a path"
+    for path in seen:
+        assert scratch in path.parents, f"{path} did not stage under the configured temp dir"
+    assert not list(scratch.iterdir())  # every method cleaned up after itself
 
 
 _PAGES = "files/a/page_images"

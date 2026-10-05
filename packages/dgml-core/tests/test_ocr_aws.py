@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from dgml_core.errors import OcrFailed
+from dgml_core.errors import MissingExtra, OcrFailed
 from dgml_core.ocr import OcrConfig, OcrProviderName, extract_text_ocr
 from dgml_core.storage import Workspace
 
@@ -59,12 +59,14 @@ class _FakeBoto3Session:
         return self._client
 
 
-def test_aws_missing_sdk_raises_ocr_failed(
+def test_aws_missing_sdk_raises_missing_extra(
     workspace: Workspace, text_pdf: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """An uninstalled `aws` extra is `MissingExtra` with the extra named as a field,
+    matching the Azure provider — not `OcrFailed`, which is a provider/API failure."""
     monkeypatch.setitem(sys.modules, "boto3", None)
     cfg = OcrConfig(provider=OcrProviderName.AWS, region="us-east-1")
-    with pytest.raises(OcrFailed, match="pip install dgml\\[aws\\]"):
+    with pytest.raises(MissingExtra, match="pip install dgml\\[aws\\]") as caught:
         extract_text_ocr(
             text_pdf,
             workspace.root / "page_text",
@@ -72,6 +74,8 @@ def test_aws_missing_sdk_raises_ocr_failed(
             page_images_dir=workspace.root / "page_images",
             config=cfg,
         )
+    assert caught.value.extra == "aws"
+    assert caught.value.distribution == "boto3"
 
 
 def test_aws_extract_writes_per_page_json(

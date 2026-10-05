@@ -126,6 +126,18 @@ _DATE_PATTERN = re.compile(
     r"^(?:(?P<MDY>\d{4}[-\/.\s]\d{1,2}[-\/.\s]\d{1,2})|"
     r"(?P<DMY>\d{1,2}[-\/.\s]\d{1,2}[-\/.\s]\d{4}))$"
 )
+# Cheap pre-filter for _normalize_date: dateparser is very slow (per-call locale
+# sweeps), so only invoke it for strings that could actually be an absolute date —
+# a month name, a two-separator numeric date, or an ``M/YYYY``. Under the STRICT
+# absolute-time/custom-formats settings we use, nothing else parses to a date, so
+# skipping these strings is behaviour-preserving (and avoids a dateparser call on
+# every name/amount/id field — the dominant cost on large documents).
+_DATE_HINT = re.compile(
+    r"jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec"
+    r"|\d{1,4}\s*[/\-.]\s*\d{1,2}\s*[/\-.]\s*\d{1,4}"
+    r"|\b\d{1,2}\s*[/\-]\s*\d{4}\b",
+    re.IGNORECASE,
+)
 _GYEAR_RE = re.compile(r"^\s*(\d{4})\s*$")
 _TIME_RE = re.compile(r"^\s*(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?(?:\s*[AaPp][Mm])?\s*$")
 
@@ -172,7 +184,7 @@ def _detect_year_position(date_str: str) -> str | None:
 
 def _normalize_date(s: str, prefer_day_first: bool = False) -> str | None:
     s = s.strip()
-    if not s:
+    if not s or not _DATE_HINT.search(s):
         return None
     dt = dateparser.parse(
         s,

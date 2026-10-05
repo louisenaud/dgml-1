@@ -27,23 +27,69 @@ The pipeline has three deterministic-by-construction properties:
    spans; the rendered XML's text is byte-identical to the transcript.
 """
 
-from dgml_core.generation.blocks import Block, Span, build_tree
-from dgml_core.generation.config import (
-    GENERATION_PROFILES,
-    GenerationConfig,
-    load_generation_config,
-    load_generation_config_file,
-    load_generation_profile,
-    resolve_generation_api_key,
-    resolve_generation_config,
-    resolve_generation_label_api_key,
-    validate_generation_models,
-)
-from dgml_core.generation.label import label_documents
-from dgml_core.generation.pipeline import ConvertOptions, convert_batch
-from dgml_core.generation.render import render_xml
-from dgml_core.generation.to_semantic import render_semantic_xml
-from dgml_core.generation.transcribe import transcribe_document
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from dgml_core.generation.blocks import Block, Span, build_tree
+    from dgml_core.generation.config import (
+        GENERATION_PROFILES,
+        GenerationConfig,
+        load_generation_config,
+        load_generation_config_file,
+        load_generation_profile,
+        resolve_generation_api_key,
+        resolve_generation_config,
+        resolve_generation_label_api_key,
+        validate_generation_models,
+    )
+    from dgml_core.generation.label import label_documents
+    from dgml_core.generation.pipeline import ConvertOptions, convert_batch
+    from dgml_core.generation.render import render_xml
+    from dgml_core.generation.to_semantic import render_semantic_xml
+    from dgml_core.generation.transcribe import transcribe_document
+
+#: Every re-export resolves on FIRST ACCESS (PEP 562). ``config``, ``label``,
+#: ``pipeline`` and ``transcribe`` all reach ``litellm``, so eagerly binding them
+#: here made ``import dgml_core.generation.semantic_transform`` — a pure
+#: string/XML helper module — cost ~1.4s. ``extraction_schema`` imports exactly
+#: two slug functions from it, which is how the LLM client ended up on the
+#: critical path of every deterministic extraction run.
+_EXPORTS = {
+    "Block": "blocks",
+    "Span": "blocks",
+    "build_tree": "blocks",
+    "GENERATION_PROFILES": "config",
+    "GenerationConfig": "config",
+    "load_generation_config": "config",
+    "load_generation_config_file": "config",
+    "load_generation_profile": "config",
+    "resolve_generation_api_key": "config",
+    "resolve_generation_config": "config",
+    "resolve_generation_label_api_key": "config",
+    "validate_generation_models": "config",
+    "label_documents": "label",
+    "ConvertOptions": "pipeline",
+    "convert_batch": "pipeline",
+    "render_xml": "render",
+    "render_semantic_xml": "to_semantic",
+    "transcribe_document": "transcribe",
+}
+
+
+def __getattr__(name: str) -> Any:
+    submodule = _EXPORTS.get(name)
+    if submodule is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+
+    value = getattr(importlib.import_module(f"{__name__}.{submodule}"), name)
+    globals()[name] = value  # cache: subsequent lookups skip __getattr__
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(__all__)
+
 
 __all__ = [
     "GENERATION_PROFILES",

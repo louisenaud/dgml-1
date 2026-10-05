@@ -223,13 +223,17 @@ def local_workspace_path(text: str) -> Path | None:
     runs the other way for a workspace addressed by path, where the root is the path the
     caller gave and no config is read to find it.)
 
-    Reads across both service forms and both roles, taking the first it finds: the option
-    belongs to :class:`~dgml_core.storage_local.LocalStore`, which may serve one role or
-    both. Wrong types read as absent — the store's own ``parse_config`` is what reports a
-    malformed value, and doing it here too would report it twice with less context.
+    Reads across both service forms and both roles, taking the first it finds and not
+    checking which provider the table names — that would mean resolving a store before a
+    ``Workspace`` exists. The option belongs to
+    :class:`~dgml_core.storage_local.LocalStore`, which may serve one role or both, so a
+    stray one under an S3 or Mongo table is honoured here and rejected by that store
+    moments later. Wrong types read as absent for the same reason: the store's own
+    ``parse_config`` reports them once, with better context.
 
-    Transitional. It exists only because ``Workspace.root`` still has to agree with the
-    store about where a workspace's files are; it goes away with ``root`` itself (#129).
+    Only this workspace's **own** config text is read, which is why
+    :func:`dgml_core.storage_resolve.load_store_configs` rejects a ``workspace_path``
+    inherited from a shared config layer.
     """
     try:
         parsed = tomllib.loads(text)

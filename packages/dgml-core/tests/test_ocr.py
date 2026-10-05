@@ -26,6 +26,7 @@ from typing import Any
 import pytest
 from dgml_core.errors import OcrConfigInvalid, OcrConfigMissing
 from dgml_core.ocr import (
+    DEFAULT_OCR_CONCURRENCY,
     OcrConfig,
     OcrProvider,
     OcrProviderName,
@@ -133,6 +134,43 @@ def test_load_ocr_config_azure_happy(workspace: Workspace) -> None:
     assert cfg.provider is OcrProviderName.AZURE
     assert cfg.endpoint == "https://foo.cognitiveservices.azure.com/"
     assert cfg.api_key_env == "FOO_KEY"
+
+
+def test_load_ocr_config_max_concurrency_defaults(workspace: Workspace) -> None:
+    write_ocr_config(
+        workspace,
+        {"provider": "azure", "endpoint": "https://foo.cognitiveservices.azure.com/"},
+    )
+    cfg = load_ocr_config(workspace)
+    assert cfg.max_concurrency == DEFAULT_OCR_CONCURRENCY == 5
+
+
+def test_load_ocr_config_max_concurrency_override(workspace: Workspace) -> None:
+    write_ocr_config(
+        workspace,
+        {
+            "provider": "azure",
+            "endpoint": "https://foo.cognitiveservices.azure.com/",
+            "max_concurrency": 12,
+        },
+    )
+    assert load_ocr_config(workspace).max_concurrency == 12
+
+
+@pytest.mark.parametrize("bad", [0, -1, 2.5, True, "5"])
+def test_load_ocr_config_max_concurrency_rejects_non_positive_int(
+    workspace: Workspace, bad: object
+) -> None:
+    write_ocr_config(
+        workspace,
+        {
+            "provider": "azure",
+            "endpoint": "https://foo.cognitiveservices.azure.com/",
+            "max_concurrency": bad,
+        },
+    )
+    with pytest.raises(OcrConfigInvalid, match="max_concurrency"):
+        load_ocr_config(workspace)
 
 
 def test_load_ocr_config_azure_no_key_env(workspace: Workspace) -> None:

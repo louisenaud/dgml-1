@@ -13,6 +13,9 @@ dev-dependencies = [
     "boto3>=1.34",
     "azure-ai-documentintelligence>=1.0",
     "azure-identity>=1.15",
+    # Pillow (the OCR extras' deskew dependency) — in dev so the rotation
+    # tests and mypy can see it. Tests build/rotate images in-process.
+    "Pillow>=10.0",
     # PyObjC (the `dgml[macos]` extra) is macOS-only — gated to darwin so it
     # installs in dev there (Apple Vision tests run) and is skipped on
     # Linux/Windows CI (those tests skip).

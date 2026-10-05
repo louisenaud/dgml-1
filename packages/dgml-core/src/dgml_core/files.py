@@ -28,6 +28,7 @@ from .conversion import (
     load_conversion_config,
 )
 from .errors import (
+    CONVERT_TO_PDF_OPERATION,
     AuthError,
     ConflictError,
     DgmlError,
@@ -35,6 +36,7 @@ from .errors import (
     FileNotFound,
     InvalidArgument,
     InvalidPDF,
+    MissingExtra,
     OcrFailed,
     PageRenderFailed,
     RecordedError,
@@ -44,7 +46,6 @@ from .errors import (
     now_iso,
 )
 from .hashing import sha256_file
-from .hybrid import extract_text_hybrid
 from .ids import RECORD_ID_SHAPE, is_record_id, new_id
 from .models import FileRecord
 from .ocr import extract_text_ocr, load_ocr_config
@@ -479,7 +480,7 @@ class FileStore:
                     self.ws,
                     file_id,
                     RecordedError(
-                        operation="convert_to_pdf",
+                        operation=CONVERT_TO_PDF_OPERATION,
                         message=message,
                         occurred_at=now_iso(),
                         permanent=True,
@@ -635,7 +636,11 @@ class FileStore:
                     page_images_dir=pages_dir,
                     config=config,
                 )
-        except (OcrFailed, AuthError) as exc:
+        # MissingExtra joins these deliberately: an uninstalled `azure`/`aws` extra
+        # is the same shape of problem as a bad credential — permanent until the
+        # environment is fixed, and no reason to fail the whole add. Without it here
+        # the File would not land at all.
+        except (OcrFailed, AuthError, MissingExtra) as exc:
             # Provider/auth failures are recorded as permanent — re-running
             # without changing config or credentials won't help. `dgml check
             # --retry-errors` is the recovery path once the user fixes them.
@@ -653,6 +658,12 @@ class FileStore:
         verbose: bool = False,
         debug: bool = False,
     ) -> tuple[str | None, dict[str, Any] | None]:
+        # Imported HERE, not at module scope: ``.hybrid`` reaches ``.llm`` →
+        # ``litellm``, ~1.4s of the package's ~1.66s import cost, and this is the
+        # only call site. Every consumer that just stores files or reads a
+        # workspace used to pay it. See the note in ``dgml_core/__init__.py``.
+        from .hybrid import extract_text_hybrid
+
         try:
             config = load_ocr_config(self.ws)
             text_extraction_config = load_text_extraction_config(self.ws)
@@ -678,7 +689,7 @@ class FileStore:
                     verbose=verbose,
                     debug=debug,
                 )
-        except (OcrFailed, AuthError) as exc:
+        except (OcrFailed, AuthError, MissingExtra) as exc:
             return self._record_text_failure(file_id, str(exc), permanent=True), None
 
         return self._classify_and_record(result, file_id, page_count, mode_label="hybrid")

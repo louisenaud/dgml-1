@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
-from .errors import AuthError, OcrConfigInvalid, OcrFailed
+from .errors import AuthError, MissingExtra, OcrConfigInvalid, OcrFailed
 from .ocr import OcrConfig, OcrProvider, OcrProviderName
 
 
@@ -45,8 +45,10 @@ class AwsProvider(OcrProvider):
             import boto3
             from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
         except ImportError as exc:
-            raise OcrFailed(
-                "boto3 is required for AWS OCR. Install with `pip install dgml[aws]`."
+            raise MissingExtra(
+                "boto3 is required for AWS OCR. Install with `pip install dgml[aws]`.",
+                extra="aws",
+                distribution="boto3",
             ) from exc
 
         try:

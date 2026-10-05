@@ -19,9 +19,11 @@ Cells are grouped by BFS with a connection distance set by ``row_gap`` /
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.worksheet import Worksheet
 
 
 def is_row_hidden(sheet: Any, r: int) -> bool:
@@ -37,6 +39,28 @@ def is_col_hidden(sheet: Any, c: int) -> bool:
     return False
 
 
+def _existing_cells(sheet: Any) -> Iterator[tuple[int, int, Any]] | None:
+    """``(row, column, value)`` for the cells the sheet holds, in row-major
+    order (streamed, so a sheet of many stored empty cells is not copied),
+    or ``None`` for a sheet that has to be walked.
+
+    ``sheet.cell(row, column)`` creates a cell for every coordinate it is
+    asked about, so walking ``1..max_row`` by ``1..max_column`` allocates the
+    whole declared rectangle: one stray formatted cell far from the data (a
+    dimension of ``A1:HV65465`` around three values) is 15 million cells and
+    minutes of work for nothing. A regular openpyxl worksheet keeps the cells
+    that exist in ``_cells``, keyed by ``(row, column)``, and there is no
+    public way to read them without creating the rest. The map is private,
+    so the read is guarded twice: the sheet must be openpyxl's own
+    ``Worksheet`` (read-only and write-only sheets stream and have no map),
+    and the attribute must still be the dict this version keeps there.
+    """
+    cells = getattr(sheet, "_cells", None)
+    if not isinstance(sheet, Worksheet) or not isinstance(cells, dict):
+        return None
+    return ((row, column, cells[(row, column)].value) for row, column in sorted(cells))
+
+
 def find_islands(sheet: Any, row_gap: int = 2, col_gap: int = 2) -> list[tuple[int, int, int, int]]:
     """Return island bounding boxes ``(min_row, min_col, max_row, max_col)``.
 
@@ -44,14 +68,28 @@ def find_islands(sheet: Any, row_gap: int = 2, col_gap: int = 2) -> list[tuple[i
     maximum consecutive empty rows/columns tolerated within one island.
     """
     active_cells: list[tuple[int, int]] = []
-    for r in range(1, sheet.max_row + 1):
-        if is_row_hidden(sheet, r):
-            continue
-        for c in range(1, sheet.max_column + 1):
-            if is_col_hidden(sheet, c):
+    existing = _existing_cells(sheet)
+    if existing is None:
+        for r in range(1, sheet.max_row + 1):
+            if is_row_hidden(sheet, r):
                 continue
-            val = sheet.cell(row=r, column=c).value
-            if val is not None and str(val).strip() != "":
+            for c in range(1, sheet.max_column + 1):
+                if is_col_hidden(sheet, c):
+                    continue
+                val = sheet.cell(row=r, column=c).value
+                if val is not None and str(val).strip() != "":
+                    active_cells.append((r, c))
+    else:
+        hidden_rows: dict[int, bool] = {}
+        hidden_cols: dict[int, bool] = {}
+        for r, c, val in existing:
+            if val is None or str(val).strip() == "":
+                continue
+            if r not in hidden_rows:
+                hidden_rows[r] = is_row_hidden(sheet, r)
+            if c not in hidden_cols:
+                hidden_cols[c] = is_col_hidden(sheet, c)
+            if not (hidden_rows[r] or hidden_cols[c]):
                 active_cells.append((r, c))
 
     if not active_cells:

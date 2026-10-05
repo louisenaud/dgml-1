@@ -419,6 +419,11 @@ def _set_computed_attrs(
         # display text so the mandatory dg:value is still present.
         xsi_type: str | None = None
         dg_value = canonical if canonical in enum_values else None
+    elif value_type == "string":
+        # Explicitly string-typed: keep dg:value (mandatory for computed fields) but
+        # verbatim, with no xsi:type and no numeric coercion (see _add_field).
+        xsi_type = None
+        dg_value = canonical if canonical is not None else text_str.strip()
     elif value_type is not None:
         xsi_type = value_type
         dg_value = canonical
@@ -481,6 +486,12 @@ def _add_field(
     if enum_values is not None:
         if canonical in enum_values:
             dg_value = canonical
+    elif value_type == "string":
+        # An explicitly string-typed field (e.g. an account/invoice identifier):
+        # keep the text verbatim with no xsi:type and no dg:value, suppressing the
+        # numeric/date heuristic so all-digit ids aren't coerced to integers (which
+        # would drop leading zeros and assert a numeric meaning the id doesn't have).
+        pass
     elif text_str or canonical:
         if value_type is not None:
             if canonical:

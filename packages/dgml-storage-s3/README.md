@@ -65,11 +65,21 @@ backend DGML knows about.
 It inherits the default path bridges (`materialize`, `staged_write`,
 `working_dir`) from `BlobStore` rather than overriding them. That is deliberate —
 those defaults are what every third-party store gets for free, so inheriting them
-means they are exercised against a real backend. But they stage through
-`tempfile`, and `TMPDIR` is a RAM-backed tmpfs on many container images: a large
-`staged_write` (a few hundred page images) would allocate into memory rather than
-disk. A production store should override them to stage under `StorageConfig.root`,
-as the `BlobStore` docstring describes.
+means they are exercised against a real backend.
+
+They stage through `tempfile`, which honours **`$TMPDIR`** — often a RAM-backed tmpfs on
+container images (Cloud Run, `emptyDir: {medium: Memory}`, the Fedora/RHEL/Arch
+defaults), where a large `staged_write` (~1.5 GB for a 500-page document) allocates into
+memory and counts against the cgroup limit. Point `TMPDIR` at real disk there, and set it
+before the process starts — Python memoizes `gettempdir()` on first call.
+
+Do **not** override the bridges to stage under `StorageConfig.root` instead: scratch
+space is a property of the deployment, not of a workspace, and on those platforms the
+workspace root is tmpfs too. One environment variable also covers every other `tempfile`
+user in DGML, including the ghostscript subprocess, rather than this store alone.
+
+Either way it is *survivable, not small* — `staged_write` holds the whole batch before
+any upload, since the caller writes its files whenever it likes.
 
 ## Licences
 
