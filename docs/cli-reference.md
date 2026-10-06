@@ -449,7 +449,9 @@ Walk the workspace and report inconsistencies. Issue kinds emitted today:
 | `semlink_nested` | docset | A semantic link points at the subject's own ancestor or descendant, stating a relationship the tree's nesting already states. Newly generated files can't carry one — re-generating clears it |
 
 `--retry-errors` clears recorded permanent errors and re-attempts the
-failed operations.
+failed operations. A cleared error for scanned pages OCR could not recover
+re-runs text extraction even though every `page_text/` file is present, so
+an OCR provider configured since then is used.
 
 > **Note:** `check` validates the stored **original** for each file (the
 > `original_filename` named in `file.json` — its presence and sha256). For a
@@ -701,8 +703,9 @@ dgml docset generate <docset_id> [--generation-config <profile|path>] [--model <
 **Auto-extract on assignment.** When the target DocSet has an extraction
 schema set (`extraction-schema.rnc`), every assignment path fires value
 extraction on the newly-assigned file: `docset add-file`, `file add
---auto-classify` (existing-DocSet decisions, which is every decision under
-`--auto-classify existing`), and `cluster` (existing-DocSet
+--auto-classify` (existing-DocSet decisions only — never a `"none"`
+decision under `--auto-classify existing`, which leaves the file
+unassigned), and `cluster` (existing-DocSet
 matches — a DocSet created mid-run can't have a schema yet). The payload
 gains an `extraction` block; extraction failures are **soft** (the error
 lands in `extraction.error`, the assignment stands, exit stays 0). No schema
@@ -1394,8 +1397,17 @@ on the last — merged and vocabulary-checked code-side, transparent in the CLI
 payloads. Chunking is strictly that escalation: an ordinary run is never
 offered the continuation tool or the `done` flag, so it can't split output
 that fits in one call. `extraction_stats.json` records both under
-`phases.phase1`: `chunk_calls` (1 = ordinary single submission) and
-`truncated_retries`. `phases.phase3.pages_out_of_range` counts the pages
+`phases.phase1`: `chunk_calls` (1 = ordinary single submission),
+`truncated_retries`, and `envelope_repairs`. The last counts `submit_values`
+calls that arrived with the tool's argument envelope repeated one level down,
+or serialized as a JSON string, and were unwrapped before the tree was read.
+A submission of which the vocabulary keeps nothing (no key names a schema
+root, or every named root carries a value of the wrong kind) is refused as an
+extraction error rather than written as an empty result; an empty tree, or
+one whose roots are all null, is still "nothing found". Leaf internals are
+not checked here.
+
+`phases.phase3.pages_out_of_range` counts the pages
 phase 1 cited that the file does not have (outside `1..page_count`, with no
 page image): their items make no phase-3 call and stay unmatched, like any
 other leaf phase 3 could not resolve, and the run still writes the tree.
@@ -1506,7 +1518,7 @@ existing record that does not carry the requested id.
 
 | `--text-mode` | Behavior |
 |---|---|
-| `digital` (default) | Extract digital text from the PDF with `pdfminer.six`. A permanent text-extraction error is recorded for files with no digital text — the File record is still created (soft fail). |
+| `digital` (default) | Extract digital text from the PDF with `pdfminer.six`. A permanent text-extraction error is recorded for files with no digital text — the File record is still created (soft fail). A page that is a full-page image with no text, or fewer than 10 words (a stamp, a page number), is taken from OCR instead, with the provider `--text-mode ocr` would use (the `ocr` config, or Apple Vision on macOS). Other pages keep their digital text, and a file with no such page never reads the OCR config. With no OCR provider, a warning names the pages and a permanent error is recorded; configure a provider and run `dgml check --retry-errors` to recover them. |
 | `ocr` | Send each rendered page image to the provider configured in `<workspace>/config.toml` (a bundled one, or your own — see [ocr-providers.md](ocr-providers.md)). The bundled cloud providers require the `azure` or `aws` extra (`uv sync --extra azure` / `uv sync --extra aws` from a repo checkout; `pip install dgml[azure]`/`dgml[aws]` once DGML is published to PyPI). See "OCR configuration" below. |
 | `hybrid` | Run `digital` then `ocr` and merge the two per-page results by grouping words covering the same area into overlap regions (boxes overlap on IoU > 0.5 *or* one mostly contained in the other, so split/merge tokenization is resolved as a unit). Each region is resolved as a whole: OCR-only regions are kept; digital-only regions (no overlapping OCR) are assumed invisible to the human eye and dropped; mixed regions compare both sides' concatenated text by dash-normalized Levenshtein distance — if they agree (distance ≤ 2) digital wins (its characters come straight from the PDF font, more reliable than OCR even when OCR's tokenization is finer), and if they disagree OCR wins. A page whose digital text is mostly unresolved glyphs (pdfminer `(cid:N)` sentinels) falls back to OCR entirely. Default is silent — pass the global `--verbose` flag to surface per-page warnings and the merge summary on stderr. Requires the same `ocr` workspace config as `--text-mode ocr`. Optionally, an LLM can make the per-region decision instead of this heuristic — declare a `text_extraction` section in `config.toml` (e.g. a local Ollama model); see [storage-layout.md](storage-layout.md#text_extraction-optional). Any LLM failure falls back to the heuristic for that page. |
 
@@ -1549,14 +1561,19 @@ The `dgml file add` response also includes:
   the PDF had no extractable digital text on any page. The File record is
   still created and a permanent error is recorded.
 - `text_extraction` — summary object on success: `{ mode, pages_written,
-  pages_with_words, total_words }`. `null` when extraction itself failed.
+  pages_with_words, total_words }`. `null` when extraction itself failed. A
+  digital-mode summary also carries `ocr_fallback_pages` (scanned pages taken
+  from OCR) and `unusable_pages` (`{page: reason}` for scanned pages OCR could
+  not recover; reasons `image_only`, `stray_text`), each only when non-empty.
 - `conversion_error` — set if a convertible source (docx/xlsx/…) could not be
   converted to PDF (missing converter binary/SDK, conversion failure). The
   File record is still created (with `page_count: null`) and a permanent error
   is recorded. `null` for PDFs and successful conversions.
 - `classification` — present **only** when `--auto-classify` is passed.
-  `decision` is `"existing"` or `"new"` (always `"existing"` under
-  `--auto-classify existing`). See "Auto-classification" below.
+  `decision` is `"existing"` or `"new"`; under `--auto-classify existing` it
+  is `"existing"` or `"none"` (no DocSet fits; file left unassigned); under
+  `--auto-classify existing-forced` it is always `"existing"`. See
+  "Auto-classification" below.
 
 Error codes that can come back on `file add`:
 
@@ -1572,13 +1589,13 @@ Error codes that can come back on `file add`:
 | `INVALID_ARGUMENT` | `--id` is malformed, was passed with a directory `<path>`, or cannot be honoured because `--on-conflict` would return an existing record with a different id. |
 | `CLASSIFICATION_CONFIG_MISSING` | `--auto-classify` was passed but `<workspace>/config.toml` is missing or has no `classification` section. |
 | `CLASSIFICATION_CONFIG_INVALID` | The `classification` section exists but a required field is missing or malformed. |
-| `NO_EXISTING_DOCSETS` | `--auto-classify existing` was passed but the workspace has no DocSets to assign to. |
+| `NO_EXISTING_DOCSETS` | `--auto-classify existing` (or `existing-forced`) was passed but the workspace has no DocSets to assign to. |
 
 The classification config is a precondition for `--auto-classify`, so a
 missing/invalid one is a **hard** error (exit 1) rather than a per-file
 soft error — every file would otherwise report the same thing. Having at
 least one DocSet is the same kind of precondition for `--auto-classify
-existing`, and is treated the same way. For a bulk directory add both are
+existing` and `existing-forced`, and is treated the same way. For a bulk directory add both are
 checked once up front, so the run aborts before any file is added.
 
 Soft-fail codes recorded on the File rather than returned as an envelope (OCR/hybrid-specific):
@@ -1610,8 +1627,9 @@ bulk flag — it makes re-runs idempotent. With `--auto-classify`, a
 DocSet created for one file becomes visible to the files processed
 after it, so similar PDFs in the batch cluster into the same DocSet.
 Under `--auto-classify existing` no DocSets are created, so that in-run
-growth doesn't happen: every file is assigned within the same curated set
-the run started with.
+growth doesn't happen: each file is either assigned within the same curated
+set the run started with or left unassigned (`decision: "none"`).
+`existing-forced` likewise creates nothing, but assigns every file.
 
 Each file commits independently: a single bad PDF (or a conflict under
 `--on-conflict error`) is recorded in its entry and the run continues.
@@ -1663,7 +1681,7 @@ carries the same fields as a single `file add` response (plus `path`, and
 `classification` when `--auto-classify` is set). A hard-failed entry
 has `status`, `path`, and an `error` object instead of a `file` record.
 
-`summary` counts (they sum to `total`):
+`summary` counts (`added` through `hard_failed` sum to `total`):
 
 | Field | Meaning |
 |---|---|
@@ -1672,6 +1690,7 @@ has `status`, `path`, and an `error` object instead of a `file` record.
 | `skipped` | Existing records returned via `--on-conflict skip`/`replace` (`created: false`). |
 | `soft_failed` | Added, but with a `page_render_error`, `page_count_error`, `text_extraction_error`, or `conversion_error` recorded. |
 | `hard_failed` | The add raised (bad PDF, conflict under `--on-conflict error`, …); the entry carries an `error` object. |
+| `unassigned` | Present only with `--auto-classify`. Files this run classified (`classification.performed: true`) that still sit in no DocSet — a `"none"` decision under `existing`, or a soft-failed classification (`classification.error`). An overlay on the counts above, not a bucket of its own: a declined file is still counted as `added`. Non-zero means some files need routing. Files skipped as duplicates are not counted, since they were not classified this run. |
 
 Run `dgml check` afterward as the authoritative health signal for the
 whole workspace.
@@ -1688,19 +1707,35 @@ The flag takes an optional `MODE`:
 |---|---|
 | `--auto-classify` | Same as `existing-or-new` — the historical default. |
 | `--auto-classify existing-or-new` | Assign to an existing DocSet if one fits; otherwise create one. |
-| `--auto-classify existing` | Always assign to an existing DocSet — the best-fitting one. Never creates a DocSet, and never declines. |
+| `--auto-classify existing` | Assign to an existing DocSet if one fits; otherwise leave the file unassigned (`decision: "none"`). Never creates a DocSet. |
+| `--auto-classify existing-forced` | Always assign to the closest existing DocSet, even when the fit is poor. Never creates a DocSet and never declines. |
+
+> **Changed behavior.** Before `existing-forced` existed, `existing` meant
+> what `existing-forced` means now: every file was assigned and `decision`
+> was always `"existing"`. `existing` can now return `decision: "none"` with
+> `docset_id: null`. Callers that relied on forced assignment should switch
+> to `existing-forced`. It also changes cost: `existing` against a
+> one-DocSet workspace used to make no LLM call, and now makes one per file
+> (declining is a possible answer, so the model has to look). A file whose
+> pages failed to render, which used to be assigned there, now gets
+> `classification.error` instead. `existing-forced` keeps the old
+> no-call path for a single DocSet.
 
 Use `existing` when the workspace's DocSets are curated and an ingest run
 must not grow new ones — otherwise one odd file anchors a one-document
 DocSet that someone has to notice and clean up.
 
-> **`existing` assumes the files belong.** The LLM is required to return a
-> DocSet, so a document whose type isn't represented in the workspace is
-> assigned to the closest one anyway rather than flagged. Only pass
-> `existing` when you already know each file fits one of the DocSets; for a
-> mixed or unknown batch use `existing-or-new`, or `dgml cluster`. With no
-> DocSets to choose from the command fails with `NO_EXISTING_DOCSETS`
-> (exit 1) instead of guessing.
+> **`existing` as a fallback router.** A document whose type isn't
+> represented in the workspace comes back with `decision: "none"`: the File
+> is kept but sits in no DocSet and is not extracted, so a caller's own
+> unknown-type handling can take over. With no DocSets to choose from the
+> command fails with `NO_EXISTING_DOCSETS` (exit 1) — there is nothing to
+> route into.
+
+Use `existing-forced` only when every file is known to belong in one of the
+workspace's DocSets: an off-type document is assigned to the closest DocSet
+anyway, not flagged. With exactly one DocSet it makes no LLM call — there is
+only one possible answer.
 
 > **Argument order matters.** `MODE` is optional, so the parser takes the
 > *next* token as its value. Put `<path>` **before** the flag —
@@ -1745,23 +1780,26 @@ The LLM is forced to pick exactly one of two tools:
   document type can answer. The `key_questions` are persisted on the
   new DocSet and shown to future classifications.
 
-`--auto-classify existing` offers only `assign_to_existing_docset`, so
-with `tool_choice="required"` a choice is forced: the LLM is told a
-perfect fit isn't required and to return the closest DocSet. `decision`
-is therefore always `"existing"`. A model that calls `create_new_docset`
-anyway is refused with `CLASSIFICATION_FAILED`.
+`--auto-classify existing` swaps `create_new_docset` for
+`no_matching_docset(reason)`: the LLM assigns when a DocSet is the new
+file's document type, and otherwise declines, giving `decision: "none"` and
+a one-sentence `decline_reason`. Fit is judged by each DocSet's description, or by
+its name alone when it has none. Key questions only break ties between
+DocSets that both fit, so a DocSet created with just a `--name` is still a
+candidate. The model is called even when the workspace holds a single DocSet,
+since declining is a possible answer.
 
-Two cases skip the LLM entirely, since neither leaves anything to decide:
+`--auto-classify existing-forced` offers `assign_to_existing_docset` alone,
+so the LLM must pick the closest DocSet.
 
-- **Exactly one DocSet** — the file is assigned to it, with the same
-  payload the model would have returned. This mode creates no DocSets,
-  so a whole bulk run over a one-DocSet workspace costs no LLM calls.
-  (`existing-or-new` still calls here — it may need a new DocSet.)
-- **No DocSets** — the command fails with `NO_EXISTING_DOCSETS`
-  (exit 1). Both preconditions (config, and at least one DocSet) are
-  checked *before* the file is ingested, single and bulk alike, so a
-  failed run adds nothing — erroring after the add would leave behind
-  the unassigned file this mode exists to avoid.
+A model that calls a tool its mode didn't offer (`create_new_docset`
+outside the default mode, `no_matching_docset` outside `existing`) is
+refused with `CLASSIFICATION_FAILED`.
+
+With **no DocSets** the command fails with `NO_EXISTING_DOCSETS` (exit 1)
+and makes no LLM call. Both preconditions (config, and at least one
+DocSet) are checked *before* the file is ingested, single and bulk alike,
+so a failed run adds nothing.
 
 Classification runs **after** the file is added, and only when `created`
 is `true`. Re-runs on a duplicate (`--on-conflict skip`) skip the LLM
@@ -1783,18 +1821,43 @@ The `classification` payload block:
     "What is the invoice total?",
     "What is the invoice date?"
   ],
+  "decline_reason": null,
   "error": null
 }
 ```
+
+`docset_id` is set only once the file is actually stored in that DocSet, so
+a block with an `error` and a non-null `docset_id` means the assignment
+landed and a later step failed; a `null` one means the file is in no DocSet.
+If a newly created DocSet can't take the file, the DocSet is deleted again
+rather than left behind empty.
 
 `docset_key_questions` echoes the assigned DocSet's `key_questions`
 (empty list for DocSets created without them). When `decision`
 is `"new"`, this is the list the LLM just proposed and that has been
 persisted on the freshly-created DocSet.
 
-Under `--auto-classify existing` the block looks the same as the
-`"existing"` example above; `decision` is never `"new"` and never
-anything else, since the assign tool is the only one offered.
+Under `--auto-classify existing` `decision` is never `"new"`. When no
+DocSet fits it is `"none"`, the File is left unassigned, no `extraction`
+block is added, the DocSet fields stay empty, and `decline_reason` carries
+the LLM's one-sentence explanation. `decline_reason` is present on every
+performed block and `null` unless `decision` is `"none"`; a decline that
+comes back without a reason is treated as a malformed response
+(`CLASSIFICATION_FAILED` in `error`), so a `"none"` always says why:
+
+```json
+"classification": {
+  "performed": true,
+  "model": "gemini/gemini-flash-lite-latest",
+  "decision": "none",
+  "docset_id": null,
+  "docset_created": false,
+  "docset_name": null,
+  "docset_key_questions": [],
+  "decline_reason": "This is a commercial lease, not a vendor invoice or a safety datasheet.",
+  "error": null
+}
+```
 
 When the file already existed (`created: false`):
 
@@ -2456,7 +2519,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `CLASSIFICATION_CONFIG_MISSING` | hard | `--auto-classify` with no `classification` config. |
 | `CLASSIFICATION_CONFIG_INVALID` | hard | The `classification` config has a missing/invalid field. |
 | `CLASSIFICATION_FAILED` | soft | The classification LLM call failed; lands in `classification.error`. |
-| `NO_EXISTING_DOCSETS` | hard | `--auto-classify existing` in a workspace with no DocSets to assign to. |
+| `NO_EXISTING_DOCSETS` | hard | `--auto-classify existing` or `existing-forced` in a workspace with no DocSets to assign to. |
 | `CLUSTERING_CONFIG_INVALID` | hard | The optional `clustering` config section failed validation. |
 | `GROUNDING_FAILED` | soft | Grounding a file failed; surfaces as `grounded: false` with a `grounding_error` on that file's `docset generate` result entry. |
 | `LABEL_MODEL_UNREACHABLE` | soft | A file's labeling could not reach the `label_model` at all (auth / bad model id / network); surfaces as a `label_error` on that file's `docset generate` result entry. The file still converts, unlabeled. |
