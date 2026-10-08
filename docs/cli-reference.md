@@ -1398,9 +1398,33 @@ payloads. Chunking is strictly that escalation: an ordinary run is never
 offered the continuation tool or the `done` flag, so it can't split output
 that fits in one call. `extraction_stats.json` records both under
 `phases.phase1`: `chunk_calls` (1 = ordinary single submission),
-`truncated_retries`, and `envelope_repairs`. The last counts `submit_values`
+`truncated_retries`, `envelope_repairs`, and `no_tool_call_retries`.
+`envelope_repairs` counts `submit_values`
 calls that arrived with the tool's argument envelope repeated one level down,
 or serialized as a JSON string, and were unwrapped before the tree was read.
+`no_tool_call_retries` counts the reminder retries given to phase-1 turns that
+ended with plain text and no tool call (the turn that finally fails a run is
+not counted). Phase 1 sends `tool_choice="required"` to every provider except
+Anthropic, so these occur only where phase 1 runs on auto: on Claude models,
+which stay on auto because a forced tool choice switches off their extended
+thinking; where litellm silently drops the parameter for a provider it
+believes lacks it; and on an endpoint that rejects `"required"` as an invalid
+request (HTTP 400/422). Such a call is resent once on auto; when the resend
+succeeds, the endpoint is remembered for the rest of the process (later
+attempts start on auto) and a warning names the model once. Timeouts, auth,
+rate-limit, context-window and content-policy errors are never resent this way.
+A text-only turn that stopped normally is answered with a reminder to call `submit_values` (or,
+for a chunked run that already recorded part of its submission, to continue
+with `append_entries`, since a resent full tree would duplicate its entries)
+and the model is asked again. Retries are never forced, so the turn that
+produces the values keeps its thinking budget, and they do not count against
+`max_tool_iters`. A third text-only turn in one attempt, or any text-only turn
+that did not stop normally (a content filter or refusal stop; a missing
+`finish_reason` counts as normal), fails the run;
+the error quotes the reply's opening text, its `finish_reason`, and whether it
+was reasoning only. The counter totals every attempt of the run (a truncation
+or schema retry starts a new attempt), so it can exceed the per-attempt limit
+the error reports.
 A submission of which the vocabulary keeps nothing (no key names a schema
 root, or every named root carries a value of the wrong kind) is refused as an
 extraction error rather than written as an empty result; an empty tree, or
